@@ -67,8 +67,9 @@ function addOpenTrade(portfolio, trade) {
  * Remove open trade and add to closed
  * @param {Object} portfolio - Portfolio state
  * @param {Object} trade - Closed trade (with exitPrice, quantity, exitFee)
+ * @param {Object} [updatedOpenTrade] - If partial close, the updated open trade to keep
  */
-function closeTradeInPortfolio(portfolio, trade) {
+function closeTradeInPortfolio(portfolio, trade, updatedOpenTrade = null) {
   const exitNotional = trade.exitPrice * trade.quantity;
   const exitFee = trade.exitFee || 0;
   const proceeds = trade.side === 'SELL'
@@ -76,7 +77,11 @@ function closeTradeInPortfolio(portfolio, trade) {
     : (exitNotional - exitFee); // sell long (increase balance)
   const idx = portfolio.openTrades.findIndex((t) => t.id === trade.id);
   if (idx >= 0) {
-    portfolio.openTrades.splice(idx, 1);
+    if (updatedOpenTrade) {
+      portfolio.openTrades[idx] = updatedOpenTrade;
+    } else {
+      portfolio.openTrades.splice(idx, 1);
+    }
   }
   portfolio.closedTrades.push(trade);
   portfolio.balance = roundTo(portfolio.balance + proceeds, 8);

@@ -59,30 +59,39 @@ function openTrade(params) {
  * @param {Object} trade - Open trade object
  * @param {number} exitPrice - Exit price (current market price)
  * @param {number} timestamp - Close timestamp
- * @returns {Object} Updated trade object
+ * @param {number} [partialQuantity] - If set, close only this quantity (partial close)
+ * @returns {Object} Updated trade object (or partial close record)
  */
-function closeTrade(trade, exitPrice, timestamp = Date.now()) {
+function closeTrade(trade, exitPrice, timestamp = Date.now(), partialQuantity = null) {
+  const qty = partialQuantity != null ? partialQuantity : trade.quantity;
   const adjustedPrice = applySlippage(exitPrice, slippage, trade.side === 'BUY' ? 'sell' : 'buy');
-  const exitFee = calculateFee(adjustedPrice * trade.quantity, fee);
+  const exitFee = calculateFee(adjustedPrice * qty, fee);
+
+  const entryFeeProrated = partialQuantity != null
+    ? (trade.entryFee || 0) * (qty / trade.quantity)
+    : (trade.entryFee || 0);
 
   let pnl;
   if (trade.side === 'BUY') {
-    pnl = (adjustedPrice - trade.entryPrice) * trade.quantity - trade.entryFee - exitFee;
+    pnl = (adjustedPrice - trade.entryPrice) * qty - entryFeeProrated - exitFee;
   } else {
-    pnl = (trade.entryPrice - adjustedPrice) * trade.quantity - trade.entryFee - exitFee;
+    pnl = (trade.entryPrice - adjustedPrice) * qty - entryFeeProrated - exitFee;
   }
 
-  const pnlPercent = (pnl / (trade.entryPrice * trade.quantity)) * 100;
+  const pnlPercent = (pnl / (trade.entryPrice * qty)) * 100;
 
-  return {
+  const closedRecord = {
     ...trade,
+    quantity: qty,
     exitPrice: roundTo(adjustedPrice, 8),
     pnl: roundTo(pnl, 8),
     pnlPercent: roundTo(pnlPercent, 4),
-    status: 'CLOSED',
+    status: partialQuantity != null ? 'PARTIAL_CLOSE' : 'CLOSED',
     exitFee,
     closedAt: timestamp,
   };
+
+  return closedRecord;
 }
 
 /**
@@ -114,21 +123,45 @@ function isTakeProfitHit(trade, low, high) {
 }
 
 /**
+ * Check if TP1 (partial) is hit - for strategies with takeProfit1
+ * @param {Object} trade - Open trade
+ * @param {number} low - Candle low
+ * @param {number} high - Candle high
+ * @returns {boolean}
+ */
+function isTakeProfit1Hit(trade, low, high) {
+  const tp1 = trade.takeProfit1;
+  if (tp1 == null || trade.partialCloseDone) return false;
+  if (trade.side === 'BUY') return high >= tp1;
+  return low <= tp1;
+}
+
+/**
  * Check if trade should be closed this candle (SL or TP hit)
- * Uses candle high/low for realistic execution
+ * Uses candle high/low for realistic execution (no lookahead)
+ * Order: SL first (conservative), then TP1 partial, then TP
  * @param {Object} trade - Open trade
  * @param {Array} candle - [timestamp, open, high, low, close, volume]
- * @returns {Object|null} { exitPrice, reason } or null if no exit
+ * @returns {Object|null} { exitPrice, reason, partialCloseQuantity?, partialClosePrice? } or null
  */
 function checkExitConditions(trade, candle) {
   const [, open, high, low, close] = candle;
 
-  // For BUY: SL hit when low touches stopLoss, TP when high touches takeProfit
-  // Check SL first (conservative - assume worst fill)
   if (isStopLossHit(trade, low, high)) {
     return { exitPrice: trade.stopLoss, reason: 'STOP_LOSS' };
   }
-  if (isTakeProfitHit(trade, low, high)) {
+  if (trade.takeProfit1 != null && isTakeProfit1Hit(trade, low, high)) {
+    const partialPct = trade.partialClosePercent ?? 0.5;
+    const partialQty = trade.quantity * partialPct;
+    const exitPrice = trade.takeProfit1;
+    return {
+      exitPrice,
+      reason: 'PARTIAL_TP1',
+      partialCloseQuantity: partialQty,
+      partialClosePrice: exitPrice,
+    };
+  }
+  if (trade.takeProfit != null && isTakeProfitHit(trade, low, high)) {
     return { exitPrice: trade.takeProfit, reason: 'TAKE_PROFIT' };
   }
 
@@ -140,5 +173,6 @@ module.exports = {
   closeTrade,
   isStopLossHit,
   isTakeProfitHit,
+  isTakeProfit1Hit,
   checkExitConditions,
 };

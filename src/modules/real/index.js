@@ -21,6 +21,7 @@ const {
 } = require('../coindcx');
 const { getSignal } = require('../strategy');
 const { applyTrendPullbackTrailingStop } = require('../strategy/trendPullbackStrategy');
+const { applyScalpMomentumTrailingStop } = require('../strategy/scalpMomentumStrategy');
 const {
   calculateStopLoss,
   calculateTakeProfit,
@@ -32,7 +33,8 @@ const {
 
 const DRY_RUN = process.env.DRY_RUN === 'true';
 const KILL_SWITCH_THRESHOLD = parseFloat(process.env.KILL_SWITCH_LOSS_PERCENT || '10');
-const INTERVAL_MS = 60000; // 1 minute
+const INTERVAL_MS_DEFAULT = 60000; // 1 minute
+const INTERVAL_MS_SCALP = 5 * 60 * 1000; // 5 minutes for scalpMomentum
 
 // Real trading risk limits (stricter than paper)
 const MAX_CAPITAL_PER_TRADE = 0.05; // 5%
@@ -50,9 +52,10 @@ let realState = {
   dailyStartBalance: 0,
   dailyLoss: 0,
   lastDayReset: 0,
+  tradesToday: [],
   symbol: 'BTC/USDT',
-  timeframe: '5m', // LTF for signals
-  htfTimeframe: '15m',
+  timeframe: '15m', // LTF for signals
+  htfTimeframe: '1h',
   strategy: null,
   quoteCurrency: 'USDT',
   ohlcvHistory: [],
@@ -269,6 +272,7 @@ async function runRealTick() {
       realState.dailyStartBalance = realState.balance;
       realState.dailyLoss = 0;
       realState.lastDayReset = dayStart;
+      realState.tradesToday = [];
     }
 
     // Fetch balance (skip in DRY_RUN, use cached)
@@ -309,6 +313,18 @@ async function runRealTick() {
           const atr = mtfSignal.atr;
           realState.currentTrade = applyTrendPullbackTrailingStop(realState.currentTrade, currentPrice, atr);
         }
+        if (realState.currentTrade.strategy === 'scalpMomentum') {
+          const ltfCandles = await fetchRealOHLCVHistory(realState.timeframe, 120);
+          const mtfSignal = getSignal(ltfCandles, {
+            strategy: 'scalpMomentum',
+            htfOhlcv: realState.htfOhlcvHistory,
+          });
+          const atr = mtfSignal.atr;
+          const ema20 = mtfSignal.ema20;
+          const result = applyScalpMomentumTrailingStop(realState.currentTrade, currentPrice, atr, ema20);
+          realState.currentTrade = result.trade;
+          // TODO: Handle result.partialCloseQuantity for 50% partial TP in live trading
+        }
 
         const sltpCheck = checkSLTP(realState.currentTrade, currentPrice);
         if (sltpCheck.hit) {
@@ -343,13 +359,13 @@ async function runRealTick() {
     }
 
     realState.ohlcvHistory = candles;
-    if (realState.strategy === 'trendPullback') {
+    if (realState.strategy === 'trendPullback' || realState.strategy === 'scalpMomentum') {
       const htfCandles = await fetchRealOHLCVHistory(realState.htfTimeframe, 120);
       realState.htfOhlcvHistory = htfCandles;
     }
 
     const signal = getSignal(candles, {
-      strategy: realState.strategy === 'trendPullback' ? 'trendPullback' : undefined,
+      strategy: (realState.strategy === 'trendPullback' || realState.strategy === 'scalpMomentum') ? realState.strategy : undefined,
       htfOhlcv: realState.htfOhlcvHistory,
     });
 
@@ -361,28 +377,39 @@ async function runRealTick() {
 
     if (signal.signal !== 'BUY') return;
 
-    // Check cooldown
-    const riskState = {
-      lastTradeClosedAt: realState.lastTradeClosedAt,
-    };
-    const riskOverrides = realState.strategy === 'trendPullback'
-      ? { maxTradesPerDay: 2, tradeCooldownMs: 30 * 60 * 1000 }
-      : null;
-    const { allowed: cooldownOk } = require('../risk').canOpenTrade(riskState, riskOverrides);
-    if (!cooldownOk) return;
-
     const { allowed, reason } = canOpenRealTrade();
     if (!allowed) {
       logger.info('Trade blocked by risk rules', { reason });
       return;
     }
 
-    const riskParams = (realState.strategy === 'trendPullback' && signal.stopLoss && signal.takeProfit)
+    // Strategy trade control (cooldown + max trades/day)
+    const riskOverrides = realState.strategy === 'trendPullback'
+      ? { maxTradesPerDay: 2, tradeCooldownMs: 30 * 60 * 1000 }
+      : realState.strategy === 'scalpMomentum'
+        ? { maxTradesPerDay: 5, tradeCooldownMs: 20 * 60 * 1000 }
+        : null;
+    const { allowed: tradeControlOk, reason: tradeControlReason } = require('../risk').canOpenTrade(
+      {
+        balance: realState.balance,
+        peakBalance: realState.peakBalance,
+        tradesToday: realState.tradesToday,
+        dailyStartBalance: realState.dailyStartBalance,
+        lastTradeClosedAt: realState.lastTradeClosedAt,
+      },
+      riskOverrides
+    );
+    if (!tradeControlOk) {
+      logger.info('Trade blocked by trade control', { reason: tradeControlReason });
+      return;
+    }
+
+    const riskParams = ((realState.strategy === 'trendPullback' || realState.strategy === 'scalpMomentum') && signal.stopLoss && signal.takeProfit)
       ? getTradeRiskParamsCustom(signal.price, 'BUY', signal.stopLoss, signal.takeProfit, realState.balance)
       : getTradeRiskParams(signal.price, 'BUY', realState.balance);
 
     const { stopLoss, takeProfit } = riskParams;
-    const positionSize = (realState.strategy === 'trendPullback' && stopLoss)
+    const positionSize = ((realState.strategy === 'trendPullback' || realState.strategy === 'scalpMomentum') && stopLoss)
       ? getRealPositionSizeWithStop(realState.balance, signal.price, stopLoss)
       : getRealPositionSize(realState.balance, signal.price, 'BUY');
 
@@ -392,11 +419,16 @@ async function runRealTick() {
     }
 
     const trade = await executeBuy(signal.price, positionSize, stopLoss, takeProfit);
-    trade.strategy = realState.strategy === 'trendPullback' ? 'trendPullback' : 'default';
+    trade.strategy = realState.strategy === 'trendPullback'
+      ? 'trendPullback'
+      : realState.strategy === 'scalpMomentum'
+        ? 'scalpMomentum'
+        : 'default';
     trade.atrAtEntry = signal.atr;
     trade.initialStopLoss = stopLoss;
     trade.initialRiskDistance = Math.abs(signal.price - stopLoss);
     realState.currentTrade = trade;
+    realState.tradesToday.push({ id: trade.id, openedAt: Date.now(), strategy: trade.strategy });
 
     // Persist trade
     await tradePersistence.persistTradeOpen(
@@ -425,11 +457,18 @@ async function startRealTrading(options = {}) {
 
   realState.symbol = options.symbol || 'BTC/USDT';
   realState.strategy = options.strategy || null;
-  if (realState.strategy === 'trendPullback') {
-    realState.timeframe = '5m';
-    realState.htfTimeframe = '15m';
+  const mtfConfigByStrategy = {
+    trendPullback: { ltfTimeframe: '15m', htfTimeframe: '1h' },
+    scalpMomentum: { ltfTimeframe: '15m', htfTimeframe: '1h' },
+  };
+  const mtfCfg = realState.strategy && mtfConfigByStrategy[realState.strategy]
+    ? mtfConfigByStrategy[realState.strategy]
+    : null;
+  if (mtfCfg) {
+    realState.timeframe = mtfCfg.ltfTimeframe;
+    realState.htfTimeframe = mtfCfg.htfTimeframe;
   } else {
-    realState.timeframe = options.timeframe || '5m';
+    realState.timeframe = options.timeframe || '15m';
   }
   realState.quoteCurrency = options.quoteCurrency || 'USDT';
   realState.killSwitchTriggered = false;
@@ -447,9 +486,12 @@ async function startRealTrading(options = {}) {
   realState.dailyLoss = 0;
   realState.lastDayReset = getStartOfDay(Date.now());
   realState.currentTrade = null;
+  realState.tradesToday = [];
+  realState.lastTradeClosedAt = 0;
 
   realState.isRunning = true;
-  realState.intervalId = setInterval(runRealTick, INTERVAL_MS);
+  const intervalMs = realState.strategy === 'scalpMomentum' ? INTERVAL_MS_SCALP : INTERVAL_MS_DEFAULT;
+  realState.intervalId = setInterval(runRealTick, intervalMs);
 
   logger.info('Real trading started', {
     symbol: realState.symbol,

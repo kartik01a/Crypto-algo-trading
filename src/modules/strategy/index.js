@@ -9,6 +9,7 @@
 const { EMA, RSI, ATR } = require('technicalindicators');
 const config = require('../../config');
 const { trendPullbackStrategy } = require('./trendPullbackStrategy');
+const { scalpMomentumStrategy } = require('./scalpMomentumStrategy');
 
 const {
   emaShort,
@@ -167,13 +168,19 @@ module.exports = {
    *
    * @param {Array<Array>} ohlcvHistory - LTF OHLCV history (5m)
    * @param {Object} [options]
-   * @param {string} [options.strategy] - "trendPullback" to use the new strategy
-   * @param {Array<Array>} [options.htfOhlcv] - HTF OHLCV history (15m) for trendPullback
+   * @param {string} [options.strategy] - "trendPullback" or "scalpMomentum" for MTF strategies
+   * @param {Array<Array>} [options.htfOhlcv] - HTF OHLCV history (strategy-dependent)
    */
   getSignal: (ohlcvHistory, options = {}) => {
     try {
       if (options.strategy === 'trendPullback') {
         return trendPullbackStrategy({
+          ltfOhlcv: ohlcvHistory,
+          htfOhlcv: options.htfOhlcv || [],
+        });
+      }
+      if (options.strategy === 'scalpMomentum') {
+        return scalpMomentumStrategy({
           ltfOhlcv: ohlcvHistory,
           htfOhlcv: options.htfOhlcv || [],
         });
@@ -195,4 +202,5 @@ module.exports = {
   applyATRFilter,
   applyTrendFilter,
   trendPullbackStrategy,
+  scalpMomentumStrategy,
 };

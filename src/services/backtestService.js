@@ -10,20 +10,32 @@ const { runBacktest } = require('../modules/backtest');
  * @returns {Promise<Object>} Backtest result
  */
 async function executeBacktest(body) {
-  const { symbol = 'BTC/USDT', timeframe = '5m', from, to, initialBalance = 10000, strategy = null, debug = false } = body;
+  const {
+    symbol = 'BTC/USDT',
+    symbols,
+    timeframe = '15m',
+    from,
+    to,
+    initialBalance = 10000,
+    strategy = null,
+    debug = true,
+    minTrades = 100,
+  } = body;
 
   if (!from || !to) {
     throw new Error('Missing required parameters: from and to dates (YYYY-MM-DD)');
   }
 
   return runBacktest({
-    symbol,
+    symbol: symbols ? undefined : symbol,
+    symbols,
     timeframe,
     from,
     to,
     initialBalance,
     strategy,
     debug,
+    minTrades,
   });
 }
 

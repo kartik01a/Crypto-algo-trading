@@ -33,24 +33,64 @@ const {
  * @param {Array} state.tradesToday - Trades executed today
  * @param {number} state.dailyStartBalance - Balance at start of day
  * @param {number} [state.lastTradeClosedAt] - Timestamp of last closed trade (for cooldown)
+ * @param {number} [state.openTradesCount] - Number of open trades
+ * @param {number} [state.lastBuyClosedAt] - Last BUY closed timestamp (per-direction cooldown)
+ * @param {number} [state.lastSellClosedAt] - Last SELL closed timestamp (per-direction cooldown)
+ * @param {boolean} [state.lastBuyWasLoss] - Last BUY was a loss
+ * @param {boolean} [state.lastSellWasLoss] - Last SELL was a loss
  * @param {Object} [overrides]
  * @param {number} [overrides.maxTradesPerDay] - Optional override for max trades/day
  * @param {number} [overrides.tradeCooldownMs] - Optional override for cooldown (ms)
+ * @param {number} [overrides.maxConcurrentTrades] - Max open trades (default: 1)
+ * @param {boolean} [overrides.perDirectionCooldown] - Use lastBuyClosedAt/lastSellClosedAt
+ * @param {boolean} [overrides.skipAfterLossInSameDirection] - Skip if last trade same dir was loss within cooldown
  * @param {number} [overrides.now] - Optional timestamp override (ms) for cooldown timing
  * @returns {Object} { allowed: boolean, reason?: string }
  */
 function canOpenTrade(state, overrides = null) {
-  const { balance, peakBalance, tradesToday, dailyStartBalance, lastTradeClosedAt } = state;
+  const {
+    balance,
+    peakBalance,
+    tradesToday,
+    dailyStartBalance,
+    lastTradeClosedAt,
+    openTradesCount = 0,
+    lastBuyClosedAt,
+    lastSellClosedAt,
+    lastBuyWasLoss,
+    lastSellWasLoss,
+  } = state;
   const maxTrades = overrides && typeof overrides.maxTradesPerDay === 'number'
     ? overrides.maxTradesPerDay
     : maxTradesPerDay;
   const cooldownMs = overrides && typeof overrides.tradeCooldownMs === 'number'
     ? overrides.tradeCooldownMs
     : tradeCooldownMs;
+  const maxConcurrent = overrides && typeof overrides.maxConcurrentTrades === 'number'
+    ? overrides.maxConcurrentTrades
+    : 1;
+  const maxDrawdownOverride = overrides && typeof overrides.maxDrawdown === 'number'
+    ? overrides.maxDrawdown
+    : maxDrawdown;
+  const perDirectionCooldown = overrides && overrides.perDirectionCooldown === true;
+  const skipAfterLoss = overrides && overrides.skipAfterLossInSameDirection === true;
   const now = overrides && typeof overrides.now === 'number' ? overrides.now : Date.now();
 
-  // Trade cooldown: 10 minutes between trades
-  if (lastTradeClosedAt && cooldownMs) {
+  // Max concurrent trades
+  if (openTradesCount >= maxConcurrent) {
+    return { allowed: false, reason: 'Max concurrent trades reached' };
+  }
+
+  // Per-direction cooldown (scalpMomentum)
+  if (perDirectionCooldown && cooldownMs) {
+    // Caller must pass side when using this - we check both and caller filters by side
+    // Actually we need to know the side. Let me add a canOpenTradeForSide or pass side in overrides
+    // For now, we'll check in the backtest and pass lastBuyClosedAt/lastSellClosedAt in state
+    // The backtest will call with side in overrides
+  }
+
+  // Legacy: single lastTradeClosedAt cooldown
+  if (!perDirectionCooldown && lastTradeClosedAt && cooldownMs) {
     const elapsed = now - lastTradeClosedAt;
     if (elapsed < cooldownMs) {
       return { allowed: false, reason: 'Trade cooldown active' };
@@ -64,7 +104,7 @@ function canOpenTrade(state, overrides = null) {
 
   // Max drawdown check
   const currentDrawdown = peakBalance > 0 ? (peakBalance - balance) / peakBalance : 0;
-  if (currentDrawdown >= maxDrawdown) {
+  if (currentDrawdown >= maxDrawdownOverride) {
     return { allowed: false, reason: 'Max drawdown exceeded' };
   }
 
@@ -72,6 +112,43 @@ function canOpenTrade(state, overrides = null) {
   const dailyLoss = dailyStartBalance > 0 ? (dailyStartBalance - balance) / dailyStartBalance : 0;
   if (dailyLoss >= maxDailyLoss) {
     return { allowed: false, reason: 'Max daily loss exceeded' };
+  }
+
+  return { allowed: true };
+}
+
+/**
+ * Check if we can open a trade for scalpMomentum (per-direction cooldown + loss filter)
+ * @param {Object} state - Same as canOpenTrade + side
+ * @param {Object} overrides - Same + side: 'BUY'|'SELL'
+ */
+function canOpenScalpMomentumTrade(state, overrides) {
+  const { side } = overrides || {};
+  const cooldownMs = overrides?.tradeCooldownMs ?? 10 * 60 * 1000;
+  const skipAfterLoss = overrides?.skipAfterLossInSameDirection === true;
+  const now = overrides?.now ?? Date.now();
+
+  // First run standard checks (with maxConcurrentTrades)
+  const base = canOpenTrade(state, overrides);
+  if (!base.allowed) return base;
+
+  // Per-direction cooldown: 10 min between same-direction trades
+  // skipAfterLoss: only skip when last same-direction trade was LOSS (allow re-entry sooner after win)
+  if (side === 'BUY') {
+    if (state.lastBuyClosedAt && (now - state.lastBuyClosedAt) < cooldownMs) {
+      if (skipAfterLoss && state.lastBuyWasLoss) {
+        return { allowed: false, reason: 'Last BUY was loss within cooldown' };
+      }
+      if (!skipAfterLoss) return { allowed: false, reason: 'BUY cooldown active' };
+    }
+  }
+  if (side === 'SELL') {
+    if (state.lastSellClosedAt && (now - state.lastSellClosedAt) < cooldownMs) {
+      if (skipAfterLoss && state.lastSellWasLoss) {
+        return { allowed: false, reason: 'Last SELL was loss within cooldown' };
+      }
+      if (!skipAfterLoss) return { allowed: false, reason: 'SELL cooldown active' };
+    }
   }
 
   return { allowed: true };
@@ -186,6 +263,7 @@ function getTradeRiskParamsCustom(entryPrice, side, stopLoss, takeProfit, balanc
 
 module.exports = {
   canOpenTrade,
+  canOpenScalpMomentumTrade,
   calculateStopLoss,
   calculateTakeProfit,
   calculatePositionSize,

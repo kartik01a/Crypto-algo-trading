@@ -3,6 +3,8 @@
  * Express API server
  */
 
+require('dotenv').config();
+
 const express = require('express');
 const config = require('./config');
 const backtestService = require('./services/backtestService');

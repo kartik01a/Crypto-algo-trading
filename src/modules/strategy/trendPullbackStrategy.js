@@ -1,5 +1,11 @@
 const { EMA, RSI, ATR } = require('technicalindicators');
 const { roundTo } = require('../../utils/helpers');
+const {
+  enforceMinSlDistance,
+  enforceMinTpDistance,
+  MIN_ATR_PERCENT,
+  applyTradeFilters,
+} = require('../tradeFilter');
 
 const LTF_EMA_PERIOD = 20;
 const LTF_RSI_PERIOD = 14;
@@ -13,7 +19,7 @@ const MIN_CANDLES = 50;
 
 // Filters (per spec)
 const TREND_STRENGTH_MIN = 0.0015; // 0.15%
-const ATR_VOL_THRESHOLD = 0.003; // 0.3%
+const ATR_VOL_THRESHOLD = MIN_ATR_PERCENT / 100; // 0.4%
 
 // Strict pullback bands (relative to EMA20, normalized by price)
 const PULLBACK_BUY_MIN = -0.015;
@@ -88,15 +94,19 @@ function getTrendFromHtf(htfOhlcv) {
 }
 
 function buildStops(price, atr, side) {
+  const rawSlDistance = 1.0 * atr;
+  const slDistance = enforceMinSlDistance(price, rawSlDistance);
+  const tpDistance = enforceMinTpDistance(slDistance);
+
   if (side === 'BUY') {
     return {
-      stopLoss: roundTo(price - 1.0 * atr, 8),
-      takeProfit: roundTo(price + 2.5 * atr, 8),
+      stopLoss: roundTo(price - slDistance, 8),
+      takeProfit: roundTo(price + tpDistance, 8),
     };
   }
   return {
-    stopLoss: roundTo(price + 1.0 * atr, 8),
-    takeProfit: roundTo(price - 2.5 * atr, 8),
+    stopLoss: roundTo(price + slDistance, 8),
+    takeProfit: roundTo(price - tpDistance, 8),
   };
 }
 
@@ -268,8 +278,21 @@ function trendPullbackStrategy({ ltfOhlcv, htfOhlcv }) {
     debug.confirmationOk = confirmOk;
     if (pullbackOk && rsiOk && confirmOk) {
       const { stopLoss, takeProfit } = buildStops(price, atr, 'BUY');
+      const filterResult = applyTradeFilters({
+        entryPrice: price,
+        stopLoss,
+        takeProfit,
+        atr,
+        side: 'BUY',
+      });
+      if (!filterResult.pass) {
+        debug.reason = `TRADE_FILTER_${filterResult.reason}`;
+        debug.tradeMetrics = filterResult.metrics;
+        return { signal: 'HOLD', price, timestamp, stopLoss: null, takeProfit: null, atr, trend, debug };
+      }
       debug.signalReason = 'UPTREND_STRICT_PULLBACK';
-      return { signal: 'BUY', price, timestamp, stopLoss, takeProfit, atr, trend, debug };
+      debug.tradeMetrics = filterResult.metrics;
+      return { signal: 'BUY', price, timestamp, stopLoss, takeProfit, atr, trend, tradeMetrics: filterResult.metrics, debug };
     }
   }
 
@@ -282,8 +305,21 @@ function trendPullbackStrategy({ ltfOhlcv, htfOhlcv }) {
     debug.confirmationOk = confirmOk;
     if (pullbackOk && rsiOk && confirmOk) {
       const { stopLoss, takeProfit } = buildStops(price, atr, 'SELL');
+      const filterResult = applyTradeFilters({
+        entryPrice: price,
+        stopLoss,
+        takeProfit,
+        atr,
+        side: 'SELL',
+      });
+      if (!filterResult.pass) {
+        debug.reason = `TRADE_FILTER_${filterResult.reason}`;
+        debug.tradeMetrics = filterResult.metrics;
+        return { signal: 'HOLD', price, timestamp, stopLoss: null, takeProfit: null, atr, trend, debug };
+      }
       debug.signalReason = 'DOWNTREND_STRICT_PULLBACK';
-      return { signal: 'SELL', price, timestamp, stopLoss, takeProfit, atr, trend, debug };
+      debug.tradeMetrics = filterResult.metrics;
+      return { signal: 'SELL', price, timestamp, stopLoss, takeProfit, atr, trend, tradeMetrics: filterResult.metrics, debug };
     }
   }
 

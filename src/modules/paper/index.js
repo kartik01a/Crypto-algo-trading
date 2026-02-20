@@ -4,10 +4,16 @@
  */
 
 const config = require('../../config');
+const { roundTo } = require('../../utils/helpers');
 const { fetchOHLCV, fetchLatestCandle } = require('../exchange');
 const { getSignal } = require('../strategy');
 const { applyTrendPullbackTrailingStop } = require('../strategy/trendPullbackStrategy');
-const { canOpenTrade, getTradeRiskParams, getTradeRiskParamsCustom } = require('../risk');
+const {
+  applyScalpMomentumTrailingStop,
+  TP1_CLOSE_PERCENT,
+  GAP_THRESHOLD_PERCENT,
+} = require('../strategy/scalpMomentumStrategy');
+const { canOpenTrade, canOpenScalpMomentumTrade, getTradeRiskParams, getTradeRiskParamsCustom } = require('../risk');
 const { openTrade, closeTrade, checkExitConditions } = require('../execution');
 const {
   createPortfolio,
@@ -25,12 +31,13 @@ let paperState = {
   intervalId: null,
   portfolio: null,
   symbol: 'BTC/USDT',
-  timeframe: '5m', // LTF for legacy strategy
-  htfTimeframe: '15m',
+  timeframe: '15m', // LTF for legacy strategy
+  htfTimeframe: '1h',
   strategy: null,
   ohlcvHistory: [], // LTF history
   htfOhlcvHistory: [], // HTF history (trendPullback only)
   minHistoryLength: 50,
+  pendingSignal: null, // scalpMomentum: execute on next candle open
 };
 
 /**
@@ -44,16 +51,24 @@ function initPaperTrading(options = {}) {
   paperState.symbol = options.symbol || 'BTC/USDT';
   paperState.strategy = options.strategy || null;
 
-  // For trendPullback, use fixed MTF timeframes (5m entry, 15m trend)
-  if (paperState.strategy === 'trendPullback') {
-    paperState.timeframe = '5m';
-    paperState.htfTimeframe = '15m';
+  const mtfConfigByStrategy = {
+    trendPullback: { ltfTimeframe: '15m', htfTimeframe: '1h' },
+    scalpMomentum: { ltfTimeframe: '15m', htfTimeframe: '1h' },
+  };
+  const mtfCfg = paperState.strategy && mtfConfigByStrategy[paperState.strategy]
+    ? mtfConfigByStrategy[paperState.strategy]
+    : null;
+
+  if (mtfCfg) {
+    paperState.timeframe = mtfCfg.ltfTimeframe;
+    paperState.htfTimeframe = mtfCfg.htfTimeframe;
   } else {
-    paperState.timeframe = options.timeframe || '5m';
+    paperState.timeframe = options.timeframe || '15m';
   }
   paperState.portfolio = createPortfolio(options.initialBalance || config.risk.initialBalance);
   paperState.ohlcvHistory = [];
   paperState.htfOhlcvHistory = [];
+  paperState.pendingSignal = null;
 }
 
 /**
@@ -70,7 +85,7 @@ async function fetchHistory() {
   );
   paperState.ohlcvHistory = ohlcv;
 
-  if (paperState.strategy === 'trendPullback') {
+  if (paperState.strategy === 'trendPullback' || paperState.strategy === 'scalpMomentum') {
     const htf = await fetchOHLCV(
       paperState.symbol,
       paperState.htfTimeframe,
@@ -109,7 +124,7 @@ async function runPaperTick() {
     const [timestamp] = latestCandle;
     paperState.ohlcvHistory = upsertCandle(paperState.ohlcvHistory, latestCandle);
 
-    if (paperState.strategy === 'trendPullback') {
+    if (paperState.strategy === 'trendPullback' || paperState.strategy === 'scalpMomentum') {
       const latestHtf = await fetchLatestCandle(paperState.symbol, paperState.htfTimeframe);
       paperState.htfOhlcvHistory = upsertCandle(paperState.htfOhlcvHistory, latestHtf);
     }
@@ -123,13 +138,28 @@ async function runPaperTick() {
 
     // 1. Check exit conditions for open trades
     const tradesToClose = [];
+    const partialClosesFromExit = [];
     for (const trade of portfolio.openTrades) {
       const exitCheck = checkExitConditions(trade, latestCandle);
       if (exitCheck) {
-        tradesToClose.push({ trade, exitPrice: exitCheck.exitPrice, reason: exitCheck.reason });
+        if (exitCheck.reason === 'PARTIAL_TP1' && exitCheck.partialCloseQuantity != null) {
+          partialClosesFromExit.push({
+            trade,
+            partialQty: exitCheck.partialCloseQuantity,
+            partialPrice: exitCheck.partialClosePrice ?? exitCheck.exitPrice,
+          });
+        } else {
+          tradesToClose.push({ trade, exitPrice: exitCheck.exitPrice, reason: exitCheck.reason });
+        }
       }
     }
 
+    for (const { trade, partialQty, partialPrice } of partialClosesFromExit) {
+      const closedPartial = closeTrade(trade, partialPrice, timestamp, partialQty);
+      const updatedOpen = { ...trade, quantity: roundTo(trade.quantity - partialQty, 8), partialCloseDone: true };
+      closeTradeInPortfolio(portfolio, closedPartial, updatedOpen);
+      await tradePersistence.persistTradeClose(closedPartial, 'PARTIAL_TP1', 'paper');
+    }
     for (const { trade, exitPrice, reason } of tradesToClose) {
       const closedTrade = closeTrade(trade, exitPrice, timestamp);
       closeTradeInPortfolio(portfolio, closedTrade);
@@ -149,16 +179,127 @@ async function runPaperTick() {
         return applyTrendPullbackTrailingStop(t, currentPrice, atr);
       });
     }
+    if (paperState.strategy === 'scalpMomentum' && portfolio.openTrades.length > 0) {
+      const { closeTrade } = require('../execution');
+      const mtfSignal = getSignal(paperState.ohlcvHistory, {
+        strategy: 'scalpMomentum',
+        htfOhlcv: paperState.htfOhlcvHistory,
+      });
+      const currentPrice = latestCandle[4];
+      const atr = mtfSignal.atr;
+      const ema20 = mtfSignal.ema20;
+      const updatedTrades = [];
+      const partialCloses = [];
+      for (const t of portfolio.openTrades) {
+        if (t.strategy !== 'scalpMomentum') {
+          updatedTrades.push(t);
+          continue;
+        }
+        const result = applyScalpMomentumTrailingStop(t, currentPrice, atr, ema20);
+        updatedTrades.push(result.trade);
+        if (result.partialCloseQuantity != null && result.partialCloseQuantity > 0) {
+          partialCloses.push({ trade: result.trade, partialQty: result.partialCloseQuantity, partialPrice: result.partialClosePrice });
+        }
+      }
+      portfolio.openTrades = updatedTrades;
+      for (const { trade: t, partialQty, partialPrice } of partialCloses) {
+        const closedPartial = closeTrade(t, partialPrice, timestamp, partialQty);
+        const updatedOpen = { ...t, quantity: t.quantity - partialQty, partialCloseDone: true };
+        closeTradeInPortfolio(portfolio, closedPartial, updatedOpen);
+      }
+    }
+
+    // 2a. scalpMomentum: Execute PENDING signal from previous tick (entry at current candle open)
+    if (paperState.strategy === 'scalpMomentum' && paperState.pendingSignal && ['BUY', 'SELL'].includes(paperState.pendingSignal.signal)) {
+      const side = paperState.pendingSignal.signal;
+      const entryPrice = latestCandle[1]; // Current candle open
+      const signalPrice = paperState.pendingSignal.price;
+      const gapPercent = Math.abs(entryPrice - signalPrice) / signalPrice * 100;
+
+      if (gapPercent <= GAP_THRESHOLD_PERCENT) {
+        const atr = paperState.pendingSignal.atr;
+        const stopLoss = paperState.pendingSignal.stopLoss != null
+          ? roundTo(paperState.pendingSignal.stopLoss, 8)
+          : (side === 'BUY' ? roundTo(entryPrice - atr, 8) : roundTo(entryPrice + atr, 8));
+        const takeProfit1 = paperState.pendingSignal.takeProfit1;
+        const takeProfit = takeProfit1 ?? (side === 'BUY'
+          ? roundTo(entryPrice + 10 * atr, 8)
+          : roundTo(entryPrice - 10 * atr, 8));
+
+        const lastBuy = portfolio.closedTrades.filter((t) => t.side === 'BUY').pop();
+        const lastSell = portfolio.closedTrades.filter((t) => t.side === 'SELL').pop();
+        const riskState = {
+          balance: portfolio.balance,
+          peakBalance: portfolio.peakBalance,
+          initialBalance: portfolio.initialBalance,
+          tradesToday: getTradesToday(portfolio, timestamp),
+          dailyStartBalance: portfolio.dailyStartBalance,
+          openTradesCount: portfolio.openTrades.length,
+          lastBuyClosedAt: lastBuy?.closedAt || 0,
+          lastSellClosedAt: lastSell?.closedAt || 0,
+          lastBuyWasLoss: lastBuy ? (lastBuy.pnl < 0) : false,
+          lastSellWasLoss: lastSell ? (lastSell.pnl < 0) : false,
+        };
+        const riskOverrides = {
+          maxTradesPerDay: 5,
+          tradeCooldownMs: 10 * 60 * 1000,
+          maxConcurrentTrades: 3,
+          perDirectionCooldown: true,
+          skipAfterLossInSameDirection: true,
+          now: timestamp,
+          side,
+        };
+        const { allowed } = canOpenScalpMomentumTrade(riskState, riskOverrides);
+
+        if (allowed) {
+          const riskParams = getTradeRiskParamsCustom(entryPrice, side, stopLoss, takeProfit1 ?? takeProfit, portfolio.balance);
+          const { positionSize } = riskParams;
+
+          if (positionSize > 0) {
+            const trade = openTrade({
+              entryPrice,
+              quantity: positionSize,
+              side,
+              stopLoss,
+              takeProfit: takeProfit1 != null ? null : takeProfit,
+              takeProfit1: takeProfit1 ?? undefined,
+              partialClosePercent: TP1_CLOSE_PERCENT,
+              timestamp,
+              symbol: paperState.symbol,
+              strategy: 'scalpMomentum',
+              atrAtEntry: atr,
+              initialStopLoss: stopLoss,
+              initialRiskDistance: Math.abs(entryPrice - stopLoss),
+            });
+            addOpenTrade(portfolio, trade);
+            await tradePersistence.persistTradeOpen(trade, 'paper', paperState.symbol);
+          }
+        }
+      }
+      paperState.pendingSignal = null;
+    }
 
     // 2. Generate signal
     const signal = getSignal(paperState.ohlcvHistory, {
-      strategy: paperState.strategy === 'trendPullback' ? 'trendPullback' : undefined,
+      strategy: (paperState.strategy === 'trendPullback' || paperState.strategy === 'scalpMomentum') ? paperState.strategy : undefined,
       htfOhlcv: paperState.htfOhlcvHistory,
     });
     logger.signal('Paper signal', { signal: signal.signal, price: signal.price });
 
-    // 3. Execute new trade if BUY/SELL signal and no open position
-    if (['BUY', 'SELL'].includes(signal.signal) && portfolio.openTrades.length === 0) {
+    // 3. Execute new trade (trendPullback/default) or set pending signal (scalpMomentum)
+    if (paperState.strategy === 'scalpMomentum' && ['BUY', 'SELL'].includes(signal.signal) && signal.stopLoss && signal.atr) {
+      paperState.pendingSignal = {
+        signal: signal.signal,
+        price: signal.price,
+        stopLoss: signal.stopLoss,
+        takeProfit: signal.takeProfit,
+        takeProfit1: signal.takeProfit1,
+        atr: signal.atr,
+        ema20: signal.ema20,
+        timestamp,
+      };
+    } else if (['BUY', 'SELL'].includes(signal.signal) && portfolio.openTrades.length === 0) {
+      // trendPullback / default: execute immediately
       const side = signal.signal;
       const tradesToday = getTradesToday(portfolio, timestamp);
       const lastClosed = portfolio.closedTrades[portfolio.closedTrades.length - 1];
@@ -227,10 +368,10 @@ async function startPaperTrading(options = {}) {
   await fetchHistory();
 
   paperState.running = true;
-  paperState.intervalId = setInterval(
-    runPaperTick,
-    config.paper.intervalMs
-  );
+  const intervalMs = paperState.strategy === 'scalpMomentum'
+    ? 5 * 60 * 1000  // 5 minutes for scalpMomentum
+    : config.paper.intervalMs;
+  paperState.intervalId = setInterval(runPaperTick, intervalMs);
 
   // Run first tick immediately
   await runPaperTick();
