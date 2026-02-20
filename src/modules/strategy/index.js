@@ -9,6 +9,7 @@
 const { EMA, RSI, ATR } = require('technicalindicators');
 const config = require('../../config');
 const { trendPullbackStrategy } = require('./trendPullbackStrategy');
+const { dcaStrategy, createDcaState } = require('./dcaStrategy');
 
 const {
   emaShort,
@@ -178,6 +179,14 @@ module.exports = {
           htfOhlcv: options.htfOhlcv || [],
         });
       }
+      if (options.strategy === 'dca') {
+        return dcaStrategy({
+          ohlcv: ohlcvHistory,
+          dcaState: options.dcaState || createDcaState(),
+          portfolioBalance: options.portfolioBalance ?? 10000,
+          drawdownExceeded: options.drawdownExceeded ?? false,
+        });
+      }
       return generateSignal(ohlcvHistory);
     } catch (err) {
       return {
@@ -195,4 +204,6 @@ module.exports = {
   applyATRFilter,
   applyTrendFilter,
   trendPullbackStrategy,
+  dcaStrategy,
+  createDcaState,
 };

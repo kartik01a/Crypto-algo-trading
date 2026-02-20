@@ -29,13 +29,25 @@ function getExchange() {
  * @returns {Promise<Array>} Array of [timestamp, open, high, low, close, volume]
  */
 async function fetchOHLCV(symbol, timeframe, since = undefined, limit = 100) {
-  try {
-    const exchange = getExchange();
-    const ohlcv = await exchange.fetchOHLCV(symbol, timeframe, since, limit);
-    return ohlcv;
-  } catch (error) {
-    throw new Error(`Exchange fetchOHLCV failed: ${error.message}`);
+  const maxRetries = 3;
+  let lastError;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const exchange = getExchange();
+      const ohlcv = await exchange.fetchOHLCV(symbol, timeframe, since, limit);
+      return ohlcv;
+    } catch (error) {
+      lastError = error;
+      const isRetryable = /timeout|ETIMEDOUT|ECONNRESET|ENOTFOUND|network/i.test(error.message);
+      if (attempt < maxRetries && isRetryable) {
+        const delay = attempt * 2000; // 2s, 4s
+        await new Promise((r) => setTimeout(r, delay));
+      } else {
+        break;
+      }
+    }
   }
+  throw new Error(`Exchange fetchOHLCV failed: ${lastError.message}`);
 }
 
 /**

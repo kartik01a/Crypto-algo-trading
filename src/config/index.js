@@ -11,7 +11,7 @@ module.exports = {
     id: 'binance',
     options: {
       enableRateLimit: true,
-      timeout: 30000,
+      timeout: parseInt(process.env.EXCHANGE_TIMEOUT_MS, 10) || 60000, // 60s default (was 30s)
     },
   },
 
@@ -31,6 +31,24 @@ module.exports = {
     rsiOverbought: 70,
     atrPeriod: 14,
     atrThresholdPercent: 0.5, // Min ATR as % of price to trade
+    // DCA strategy (improved)
+    dca: {
+      recentHighCandles: 20,
+      ema200Period: 200,
+      levels: [
+        { dropPercent: 0.01, multiplier: 1 },
+        { dropPercent: 0.025, multiplier: 1.5 },
+        { dropPercent: 0.05, multiplier: 2 },
+        { dropPercent: 0.08, multiplier: 2.5 },
+      ],
+      maxEntries: 4,
+      exitProfitPercent: 0.025,
+      trailingActivationPercent: 0.02,
+      trailingStopPercent: 0.01,
+      maxCapitalPercent: 0.05,
+      maxConcurrentCycles: 3,
+      maxDrawdownHardStop: 0.20,
+    },
   },
 
   // Risk management defaults

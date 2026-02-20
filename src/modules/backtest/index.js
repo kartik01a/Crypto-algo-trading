@@ -8,6 +8,7 @@ const { getSignal } = require('../strategy');
 const { canOpenTrade, getTradeRiskParams } = require('../risk');
 const { getTradeRiskParamsCustom } = require('../risk');
 const { applyTrendPullbackTrailingStop } = require('../strategy/trendPullbackStrategy');
+const { checkDcaExit, resetDcaState, createDcaState, getAverageEntry, getTotalQuantity, MAX_DRAWDOWN_HARD_STOP, MAX_DRAWDOWN_NO_NEW_ENTRIES } = require('../strategy/dcaStrategy');
 const { openTrade, closeTrade, checkExitConditions } = require('../execution');
 const {
   createPortfolio,
@@ -79,8 +80,8 @@ async function runBacktest({
   let candles = ohlcv;
   let htfCandles = null;
 
-  // For trendPullback we enforce MTF timeframes
-  const ltfTimeframe = strategy === 'trendPullback' ? '5m' : timeframe;
+  // For trendPullback we enforce MTF timeframes; DCA uses 5m
+  const ltfTimeframe = (strategy === 'trendPullback' || strategy === 'dca') ? '5m' : timeframe;
   const htfTimeframe = '15m';
 
   if (!candles || candles.length === 0) {
@@ -94,13 +95,22 @@ async function runBacktest({
     throw new Error('No OHLCV data available for the specified range');
   }
 
+  const warmupPeriod = strategy === 'dca' ? 200 : 50; // DCA needs 200 for EMA200
   const portfolio = createPortfolio(initialBalance);
   // Backtest runs on historical timestamps; initialize daily reset anchor accordingly
   portfolio.lastDayReset = getStartOfDay(candles[0][0]);
   portfolio.dailyStartBalance = portfolio.balance;
-  const warmupPeriod = 50; // minimum candles before signal
+  // Align initial equity curve point to first processed candle (no lookahead)
+  if (portfolio.equityCurve[0]) {
+    portfolio.equityCurve[0].timestamp = candles[warmupPeriod]?.[0] ?? portfolio.equityCurve[0].timestamp;
+  }
   let lastTradeClosedAt = 0;
   let htfIdx = 0;
+  let dcaState = strategy === 'dca' ? createDcaState() : null;
+
+  // DCA cycle tracking (strategy === 'dca')
+  const dcaCycles = [];
+  let currentDcaCycle = null; // { startTime, equityAtStart, peakEquity, minEquity, maxDropFromEntry, maxCapitalUsed }
 
   const debugSummary = debug && strategy === 'trendPullback'
     ? {
@@ -146,20 +156,81 @@ async function runBacktest({
       });
     }
 
-    // 1. Check exit conditions for open trades (SL/TP)
+    // 1. Check exit conditions for open trades
     const tradesToClose = [];
-    for (const trade of portfolio.openTrades) {
-      const exitCheck = checkExitConditions(trade, candle);
-      if (exitCheck) {
-        tradesToClose.push({ trade, exitPrice: exitCheck.exitPrice, reason: exitCheck.reason });
+
+    // DCA: check aggregate exit (RSI, EMA20, TP, timeout)
+    let dcaExitInfo = null;
+    if (strategy === 'dca' && dcaState && dcaState.cycleActive && dcaState.entries.length > 0) {
+      if (!dcaState.trailingState) dcaState.trailingState = { active: false, highestPrice: 0 };
+      const dcaExit = checkDcaExit(dcaState.entries, candle, {
+        ohlcv: ohlcvSlice,
+        cycleStartTimestamp: dcaState.cycleStartTimestamp,
+        trailingState: dcaState.trailingState,
+      });
+      if (dcaExit) {
+        dcaExitInfo = { avgEntry: getAverageEntry(dcaState.entries), totalQty: getTotalQuantity(dcaState.entries), entries: dcaState.entries.length };
+        const dcaTrades = portfolio.openTrades.filter((t) => t.strategy === 'dca');
+        for (const trade of dcaTrades) {
+          tradesToClose.push({ trade, exitPrice: dcaExit.exitPrice, reason: dcaExit.reason });
+        }
+        resetDcaState(dcaState);
       }
     }
 
+    // Non-DCA or per-trade SL/TP for non-DCA strategies
+    if (strategy !== 'dca') {
+      for (const trade of portfolio.openTrades) {
+        const exitCheck = checkExitConditions(trade, candle);
+        if (exitCheck) {
+          tradesToClose.push({ trade, exitPrice: exitCheck.exitPrice, reason: exitCheck.reason });
+        }
+      }
+    }
+
+    let closedDcaPnl = 0;
     for (const { trade, exitPrice, reason } of tradesToClose) {
       const closedTrade = closeTrade(trade, exitPrice, timestamp);
+      closedDcaPnl += closedTrade.pnl || 0;
       closeTradeInPortfolio(portfolio, closedTrade);
       lastTradeClosedAt = timestamp;
-      await tradePersistence.persistTradeClose(closedTrade, reason, 'backtest');
+    }
+    if (strategy === 'dca' && tradesToClose.length > 0 && dcaExitInfo) {
+      const { avgEntry, totalQty, entries } = dcaExitInfo;
+      const exitPrice = tradesToClose[0]?.exitPrice;
+      const profitPercent = avgEntry && exitPrice ? ((exitPrice - avgEntry) / avgEntry) * 100 : 0;
+      // Record completed DCA cycle
+      if (currentDcaCycle) {
+        const cycleDrawdown = currentDcaCycle.peakEquity > 0 && currentDcaCycle.minEquity != null
+          ? ((currentDcaCycle.peakEquity - currentDcaCycle.minEquity) / currentDcaCycle.peakEquity) * 100
+          : 0;
+        dcaCycles.push({
+          startTime: currentDcaCycle.startTime,
+          endTime: timestamp,
+          entries,
+          pnl: closedDcaPnl,
+          returnPercent: currentDcaCycle.equityAtStart > 0
+            ? (closedDcaPnl / currentDcaCycle.equityAtStart) * 100
+            : 0,
+          maxDrawdownPercent: cycleDrawdown,
+          maxDropFromEntryPercent: currentDcaCycle.maxDropFromEntry * 100,
+          maxCapitalUsed: currentDcaCycle.maxCapitalUsed,
+          win: closedDcaPnl > 0,
+        });
+        currentDcaCycle = null;
+      }
+      if (debug) {
+        const exitReason = tradesToClose[0]?.reason || 'UNKNOWN';
+        logger.trade('DCA cycle exit', {
+          reason: exitReason,
+          avgEntry: roundTo(avgEntry, 8),
+          exitPrice,
+          totalQuantity: totalQty,
+          entries,
+          profitPercent: roundTo(profitPercent, 4),
+          totalPnl: roundTo(closedDcaPnl, 8),
+        });
+      }
     }
 
     // 2. Generate signal
@@ -172,9 +243,21 @@ async function runBacktest({
       htfSlice = htfCandles ? htfCandles.slice(0, htfIdx + 1) : [];
     }
 
+    // Compute drawdown for DCA risk control (block new entries if > 10%)
+    let drawdownExceeded = false;
+    if (strategy === 'dca') {
+      const equity = portfolio.equityCurve[portfolio.equityCurve.length - 1]?.equity ?? portfolio.balance;
+      const peakEquity = Math.max(...portfolio.equityCurve.map((p) => p.equity));
+      const drawdown = peakEquity > 0 ? (peakEquity - equity) / peakEquity : 0;
+      drawdownExceeded = drawdown >= MAX_DRAWDOWN_NO_NEW_ENTRIES;
+    }
+
     const signal = getSignal(ohlcvSlice, {
-      strategy: strategy === 'trendPullback' ? 'trendPullback' : undefined,
+      strategy: strategy === 'trendPullback' ? 'trendPullback' : strategy === 'dca' ? 'dca' : undefined,
       htfOhlcv: htfSlice,
+      dcaState: strategy === 'dca' ? dcaState : undefined,
+      portfolioBalance: strategy === 'dca' ? portfolio.balance : undefined,
+      drawdownExceeded: strategy === 'dca' ? drawdownExceeded : undefined,
     });
 
     if (debugSummary) {
@@ -235,8 +318,50 @@ async function runBacktest({
       }
     }
 
-    // 3. Apply risk rules and execute new trade (BUY or SELL)
-    if (['BUY', 'SELL'].includes(signal.signal) && portfolio.openTrades.length === 0) {
+    // 3. DCA strategy: add DCA levels (max 4 entries per cycle)
+    if (strategy === 'dca' && ['DCA_BUY_1', 'DCA_BUY_2', 'DCA_BUY_3', 'DCA_BUY_4'].includes(signal.signal)) {
+      const dcaTrades = portfolio.openTrades.filter((t) => t.strategy === 'dca');
+      if (dcaTrades.length < 4 && signal.quantity > 0) {
+        // Initialize cycle tracking on first entry
+        if (!currentDcaCycle) {
+          const equityAtStart = portfolio.equityCurve[portfolio.equityCurve.length - 1]?.equity ?? portfolio.balance;
+          currentDcaCycle = {
+            startTime: timestamp,
+            equityAtStart,
+            peakEquity: equityAtStart,
+            minEquity: equityAtStart,
+            maxDropFromEntry: 0,
+            maxCapitalUsed: 0,
+          };
+        }
+        const trade = openTrade({
+          entryPrice: signal.price,
+          quantity: signal.quantity,
+          side: 'BUY',
+          stopLoss: null,
+          takeProfit: null,
+          timestamp,
+          symbol,
+          strategy: 'dca',
+          dcaLevel: signal.level,
+        });
+        addOpenTrade(portfolio, trade);
+        if (debug) {
+          const avgEntry = dcaState && dcaState.entries.length > 0
+            ? dcaState.entries.reduce((s, e) => s + e.price * e.quantity, 0) / dcaState.entries.reduce((s, e) => s + e.quantity, 0)
+            : signal.price;
+          logger.signal('Smart DCA entry', {
+            level: signal.level,
+            price: signal.price,
+            quantity: signal.quantity,
+            entryReason: signal.debug?.entryReason || signal.debug?.reason,
+            avgEntry: roundTo(avgEntry, 8),
+          });
+        }
+      }
+    }
+    // 3b. Apply risk rules and execute new trade for non-DCA strategies (BUY or SELL)
+    else if (['BUY', 'SELL'].includes(signal.signal) && portfolio.openTrades.length === 0) {
       const side = signal.signal;
       if (debugSummary) debugSummary.entries.attempted += 1;
       const tradesToday = getTradesToday(portfolio, timestamp);
@@ -279,7 +404,6 @@ async function runBacktest({
           });
 
           addOpenTrade(portfolio, trade);
-          await tradePersistence.persistTradeOpen(trade, 'backtest', symbol);
           if (debugSummary) debugSummary.entries.opened += 1;
         } else if (debugSummary) {
           debugSummary.entries.blockedSize += 1;
@@ -291,8 +415,41 @@ async function runBacktest({
       debugSummary.entries.blockedOpenTrade += 1;
     }
 
-    // 4. Update equity curve with candle close as mark price
+    // 4. Update equity curve with candle close as mark price (includes unrealized PnL)
     updateEquityCurve(portfolio, timestamp, close);
+
+    // 4a. DCA hard stop: exit all if drawdown > 20%
+    if (strategy === 'dca' && MAX_DRAWDOWN_HARD_STOP) {
+      const equity = portfolio.equityCurve[portfolio.equityCurve.length - 1]?.equity ?? portfolio.balance;
+      const peakEquity = Math.max(...portfolio.equityCurve.map((p) => p.equity));
+      const drawdown = peakEquity > 0 ? (peakEquity - equity) / peakEquity : 0;
+      if (drawdown >= MAX_DRAWDOWN_HARD_STOP && portfolio.openTrades.length > 0) {
+        const dcaTrades = portfolio.openTrades.filter((t) => t.strategy === 'dca');
+        for (const trade of dcaTrades) {
+          const closedTrade = closeTrade(trade, close, timestamp);
+          closeTradeInPortfolio(portfolio, closedTrade);
+        }
+        resetDcaState(dcaState);
+        currentDcaCycle = null;
+        logger.warn('DCA backtest: 20% drawdown hard stop triggered - closed all positions');
+        break;
+      }
+    }
+
+    // 4b. DCA cycle tracking: update current cycle metrics each candle
+    if (strategy === 'dca' && currentDcaCycle && dcaState?.entries?.length > 0) {
+      const equity = portfolio.equityCurve[portfolio.equityCurve.length - 1]?.equity ?? portfolio.balance;
+      currentDcaCycle.peakEquity = Math.max(currentDcaCycle.peakEquity, equity);
+      currentDcaCycle.minEquity = Math.min(currentDcaCycle.minEquity ?? equity, equity);
+      const avgEntry = getAverageEntry(dcaState.entries);
+      if (avgEntry && avgEntry > 0) {
+        const dropFromEntry = (avgEntry - low) / avgEntry; // use low for worst-case in candle
+        currentDcaCycle.maxDropFromEntry = Math.max(currentDcaCycle.maxDropFromEntry, dropFromEntry);
+      }
+      const dcaTrades = portfolio.openTrades.filter((t) => t.strategy === 'dca');
+      const capitalUsed = dcaTrades.reduce((s, t) => s + (t.entryPrice * t.quantity + (t.entryFee || 0)), 0);
+      currentDcaCycle.maxCapitalUsed = Math.max(currentDcaCycle.maxCapitalUsed, capitalUsed);
+    }
   }
 
   // Close any remaining open trades at last candle close
@@ -300,10 +457,32 @@ async function runBacktest({
   const lastClose = lastCandle[4];
   const lastTimestamp = lastCandle[0];
 
+  const remainingDcaTrades = strategy === 'dca' ? portfolio.openTrades.filter((t) => t.strategy === 'dca') : [];
+  let forcedClosePnl = 0;
   for (const trade of [...portfolio.openTrades]) {
     const closedTrade = closeTrade(trade, lastClose, lastTimestamp);
+    if (trade.strategy === 'dca') forcedClosePnl += closedTrade.pnl || 0;
     closeTradeInPortfolio(portfolio, closedTrade);
-    await tradePersistence.persistTradeClose(closedTrade, 'MANUAL', 'backtest');
+  }
+
+  // Record DCA cycle if we forced-closed at end
+  if (strategy === 'dca' && currentDcaCycle && remainingDcaTrades.length > 0) {
+    const cycleDrawdown = currentDcaCycle.peakEquity > 0 && currentDcaCycle.minEquity != null
+      ? ((currentDcaCycle.peakEquity - currentDcaCycle.minEquity) / currentDcaCycle.peakEquity) * 100
+      : 0;
+    dcaCycles.push({
+      startTime: currentDcaCycle.startTime,
+      endTime: lastTimestamp,
+      entries: remainingDcaTrades.length,
+      pnl: forcedClosePnl,
+      returnPercent: currentDcaCycle.equityAtStart > 0
+        ? (forcedClosePnl / currentDcaCycle.equityAtStart) * 100
+        : 0,
+      maxDrawdownPercent: cycleDrawdown,
+      maxDropFromEntryPercent: currentDcaCycle.maxDropFromEntry * 100,
+      maxCapitalUsed: currentDcaCycle.maxCapitalUsed,
+      win: forcedClosePnl > 0,
+    });
   }
 
   updateEquityCurve(portfolio, lastTimestamp, lastClose);
@@ -311,6 +490,11 @@ async function runBacktest({
   // Calculate metrics and drawdown curve
   const summary = getSummary(portfolio);
   const closedTrades = portfolio.closedTrades;
+
+  // Save all trades to DB in one batch (when MongoDB available)
+  if (closedTrades.length > 0) {
+    await tradePersistence.persistTradesBulk(closedTrades, 'backtest', symbol);
+  }
 
   const winningTrades = closedTrades.filter((t) => t.pnl > 0);
   const losingTrades = closedTrades.filter((t) => t.pnl < 0);
@@ -324,14 +508,35 @@ async function runBacktest({
 
   const profitFactor = grossLoss > 0 ? roundTo(grossProfit / grossLoss, 4) : grossProfit > 0 ? Infinity : 0;
 
-  // Build drawdown curve from equity curve
+  // Build drawdown curve from equity (includes unrealized PnL)
   const drawdownCurve = [];
-  let peak = portfolio.initialBalance;
+  let peakEquity = portfolio.initialBalance;
+  let maxEquityDrawdown = 0;
   for (const point of portfolio.equityCurve) {
     const equity = point.equity;
-    if (equity > peak) peak = equity;
-    const drawdown = peak > 0 ? ((peak - equity) / peak) * 100 : 0;
+    if (equity > peakEquity) peakEquity = equity;
+    const drawdown = peakEquity > 0 ? ((peakEquity - equity) / peakEquity) * 100 : 0;
+    maxEquityDrawdown = Math.max(maxEquityDrawdown, drawdown);
     drawdownCurve.push({ timestamp: point.timestamp, drawdown: roundTo(drawdown, 4), equity });
+  }
+
+  // DCA-specific metrics
+  const totalCycles = dcaCycles.length;
+  const winCycles = dcaCycles.filter((c) => c.win).length;
+  const lossCycles = totalCycles - winCycles;
+  const avgCycleReturn = totalCycles > 0
+    ? roundTo(dcaCycles.reduce((s, c) => s + c.returnPercent, 0) / totalCycles, 4)
+    : 0;
+  const maxCycleDrawdown = totalCycles > 0
+    ? roundTo(Math.max(0, ...dcaCycles.map((c) => c.maxDrawdownPercent || 0)), 4)
+    : 0;
+
+  // Max drawdown from equity curve (includes unrealized PnL)
+  const maxDrawdown = roundTo(maxEquityDrawdown, 4);
+
+  // Validation: warn if maxDrawdown is 0 (may indicate no trades or insufficient data)
+  if (maxDrawdown === 0 && (closedTrades.length > 0 || totalCycles > 0)) {
+    logger.warn('Backtest: maxDrawdown is 0 - verify equity curve and metrics are correct');
   }
 
   // Trade list for response
@@ -343,15 +548,16 @@ async function runBacktest({
     status: t.status,
     openedAt: t.openedAt,
     closedAt: t.closedAt,
+    ...(t.dcaLevel && { dcaLevel: t.dcaLevel }),
   }));
 
-  return {
+  const result = {
     finalBalance: summary.balance,
     initialBalance: portfolio.initialBalance,
     totalTrades: closedTrades.length,
     winRate,
     profitFactor,
-    maxDrawdown: summary.maxDrawdown,
+    maxDrawdown,
     totalPnl: summary.totalPnl,
     totalPnlPercent: summary.totalPnlPercent,
     equityCurve: portfolio.equityCurve,
@@ -361,13 +567,104 @@ async function runBacktest({
       strategy: strategy || 'default',
       ltfTimeframe,
       htfTimeframe: strategy === 'trendPullback' ? htfTimeframe : null,
-      candles: { ltf: candles.length, htf: strategy === 'trendPullback' ? (htfCandles ? htfCandles.length : 0) : null },
+      candles: {
+        ltf: candles.length,
+        htf: strategy === 'trendPullback' ? (htfCandles ? htfCandles.length : 0) : null,
+      },
     },
     debugSummary: debugSummary || undefined,
   };
+
+  // DCA-specific output
+  if (strategy === 'dca') {
+    result.totalCycles = totalCycles;
+    result.winCycles = winCycles;
+    result.lossCycles = lossCycles;
+    result.avgCycleReturn = avgCycleReturn;
+    result.maxCycleDrawdown = maxCycleDrawdown;
+    result.maxEquityDrawdown = maxDrawdown;
+    result.cycles = dcaCycles.map((c) => ({
+      startTime: c.startTime,
+      endTime: c.endTime,
+      entries: c.entries,
+      pnl: roundTo(c.pnl, 8),
+      returnPercent: roundTo(c.returnPercent, 4),
+      maxDrawdownPercent: roundTo(c.maxDrawdownPercent, 4),
+      maxDropFromEntryPercent: roundTo(c.maxDropFromEntryPercent, 4),
+      maxCapitalUsed: roundTo(c.maxCapitalUsed, 8),
+      win: c.win,
+    }));
+  }
+
+  return result;
+}
+
+/**
+ * Run backtest across multiple symbols (capital split equally)
+ * @param {Object} params - Same as runBacktest plus symbols array
+ * @param {Array<string>} params.symbols - e.g. ['BTC/USDT', 'ETH/USDT']
+ * @returns {Promise<Object>} Aggregated results
+ */
+async function runBacktestMultiSymbol({
+  symbols,
+  timeframe,
+  from,
+  to,
+  initialBalance = 10000,
+  strategy = null,
+  debug = false,
+}) {
+  if (!symbols || symbols.length === 0) {
+    throw new Error('symbols array is required');
+  }
+  const balancePerSymbol = initialBalance / symbols.length;
+  const results = await Promise.all(
+    symbols.map((symbol) =>
+      runBacktest({
+        symbol,
+        timeframe,
+        from,
+        to,
+        initialBalance: balancePerSymbol,
+        strategy,
+        debug: false,
+      })
+    )
+  );
+
+  const aggregated = {
+    finalBalance: results.reduce((s, r) => s + r.finalBalance, 0),
+    initialBalance,
+    totalTrades: results.reduce((s, r) => s + r.totalTrades, 0),
+    totalPnl: results.reduce((s, r) => s + r.totalPnl, 0),
+    totalPnlPercent: initialBalance > 0
+      ? roundTo((results.reduce((s, r) => s + r.totalPnl, 0) / initialBalance) * 100, 4)
+      : 0,
+    maxDrawdown: results.length > 0 ? Math.max(...results.map((r) => r.maxDrawdown || 0)) : 0,
+    symbols: symbols.map((sym, i) => ({
+      symbol: sym,
+      finalBalance: results[i].finalBalance,
+      totalTrades: results[i].totalTrades,
+      totalPnl: results[i].totalPnl,
+    })),
+    meta: { strategy: strategy || 'default', symbols },
+  };
+
+  const totalClosed = results.reduce((s, r) => s + r.totalTrades, 0);
+  const winningTrades = results.reduce((s, r) => s + (r.tradeList || []).filter((t) => t.pnl > 0).length, 0);
+  aggregated.winRate = totalClosed > 0 ? roundTo((winningTrades / totalClosed) * 100, 2) : 0;
+
+  if (strategy === 'dca') {
+    aggregated.totalCycles = results.reduce((s, r) => s + (r.totalCycles || 0), 0);
+    aggregated.winCycles = results.reduce((s, r) => s + (r.winCycles || 0), 0);
+    aggregated.lossCycles = results.reduce((s, r) => s + (r.lossCycles || 0), 0);
+  }
+
+  return aggregated;
 }
 
 module.exports = {
   runBacktest,
+  runBacktestMultiSymbol,
   fetchBacktestData,
 };

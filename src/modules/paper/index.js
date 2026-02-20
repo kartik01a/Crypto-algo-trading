@@ -5,8 +5,9 @@
 
 const config = require('../../config');
 const { fetchOHLCV, fetchLatestCandle } = require('../exchange');
-const { getSignal } = require('../strategy');
+const { getSignal, createDcaState } = require('../strategy');
 const { applyTrendPullbackTrailingStop } = require('../strategy/trendPullbackStrategy');
+const { checkDcaExit, resetDcaState, MAX_DRAWDOWN_NO_NEW_ENTRIES } = require('../strategy/dcaStrategy');
 const { canOpenTrade, getTradeRiskParams, getTradeRiskParamsCustom } = require('../risk');
 const { openTrade, closeTrade, checkExitConditions } = require('../execution');
 const {
@@ -30,6 +31,7 @@ let paperState = {
   strategy: null,
   ohlcvHistory: [], // LTF history
   htfOhlcvHistory: [], // HTF history (trendPullback only)
+  dcaState: null, // DCA cycle state (dca strategy only)
   minHistoryLength: 50,
 };
 
@@ -48,8 +50,14 @@ function initPaperTrading(options = {}) {
   if (paperState.strategy === 'trendPullback') {
     paperState.timeframe = '5m';
     paperState.htfTimeframe = '15m';
+    paperState.minHistoryLength = 50;
+  } else if (paperState.strategy === 'dca') {
+    paperState.timeframe = '5m';
+    paperState.minHistoryLength = 200; // DCA needs 200 for EMA200
+    paperState.dcaState = createDcaState();
   } else {
     paperState.timeframe = options.timeframe || '5m';
+    paperState.minHistoryLength = 50;
   }
   paperState.portfolio = createPortfolio(options.initialBalance || config.risk.initialBalance);
   paperState.ohlcvHistory = [];
@@ -78,6 +86,9 @@ async function fetchHistory() {
       limit
     );
     paperState.htfOhlcvHistory = htf;
+  }
+  if (paperState.strategy === 'dca') {
+    paperState.dcaState = paperState.dcaState || createDcaState();
   }
 }
 
@@ -123,10 +134,30 @@ async function runPaperTick() {
 
     // 1. Check exit conditions for open trades
     const tradesToClose = [];
-    for (const trade of portfolio.openTrades) {
-      const exitCheck = checkExitConditions(trade, latestCandle);
-      if (exitCheck) {
-        tradesToClose.push({ trade, exitPrice: exitCheck.exitPrice, reason: exitCheck.reason });
+
+    if (paperState.strategy === 'dca' && paperState.dcaState?.cycleActive && paperState.dcaState.entries.length > 0) {
+      if (!paperState.dcaState.trailingState) paperState.dcaState.trailingState = { active: false, highestPrice: 0 };
+      const dcaExit = checkDcaExit(paperState.dcaState.entries, latestCandle, {
+        ohlcv: paperState.ohlcvHistory,
+        cycleStartTimestamp: paperState.dcaState.cycleStartTimestamp,
+        trailingState: paperState.dcaState.trailingState,
+      });
+      if (dcaExit) {
+        const dcaTrades = portfolio.openTrades.filter((t) => t.strategy === 'dca');
+        for (const trade of dcaTrades) {
+          tradesToClose.push({ trade, exitPrice: dcaExit.exitPrice, reason: dcaExit.reason });
+        }
+        logger.signal('Smart DCA exit', { reason: dcaExit.reason, exitPrice: dcaExit.exitPrice });
+        resetDcaState(paperState.dcaState);
+      }
+    }
+
+    if (paperState.strategy !== 'dca') {
+      for (const trade of portfolio.openTrades) {
+        const exitCheck = checkExitConditions(trade, latestCandle);
+        if (exitCheck) {
+          tradesToClose.push({ trade, exitPrice: exitCheck.exitPrice, reason: exitCheck.reason });
+        }
       }
     }
 
@@ -151,14 +182,49 @@ async function runPaperTick() {
     }
 
     // 2. Generate signal
+    let drawdownExceeded = false;
+    if (paperState.strategy === 'dca') {
+      const [, , , , close] = latestCandle;
+      const equity = portfolio.balance + portfolio.openTrades.reduce((s, t) => {
+        const pnl = t.side === 'BUY' ? (close - t.entryPrice) * t.quantity : (t.entryPrice - close) * t.quantity;
+        return s + pnl;
+      }, 0);
+      const peakEquity = Math.max(...portfolio.equityCurve.map((p) => p.equity), equity);
+      const drawdown = peakEquity > 0 ? (peakEquity - equity) / peakEquity : 0;
+      drawdownExceeded = drawdown >= MAX_DRAWDOWN_NO_NEW_ENTRIES;
+    }
+
     const signal = getSignal(paperState.ohlcvHistory, {
-      strategy: paperState.strategy === 'trendPullback' ? 'trendPullback' : undefined,
+      strategy: paperState.strategy === 'trendPullback' ? 'trendPullback' : paperState.strategy === 'dca' ? 'dca' : undefined,
       htfOhlcv: paperState.htfOhlcvHistory,
+      dcaState: paperState.strategy === 'dca' ? paperState.dcaState : undefined,
+      portfolioBalance: paperState.strategy === 'dca' ? portfolio.balance : undefined,
+      drawdownExceeded: paperState.strategy === 'dca' ? drawdownExceeded : undefined,
     });
     logger.signal('Paper signal', { signal: signal.signal, price: signal.price });
 
-    // 3. Execute new trade if BUY/SELL signal and no open position
-    if (['BUY', 'SELL'].includes(signal.signal) && portfolio.openTrades.length === 0) {
+    // 3a. DCA strategy: add DCA levels
+    if (paperState.strategy === 'dca' && ['DCA_BUY_1', 'DCA_BUY_2', 'DCA_BUY_3', 'DCA_BUY_4'].includes(signal.signal)) {
+      const dcaTrades = portfolio.openTrades.filter((t) => t.strategy === 'dca');
+      if (dcaTrades.length < 4 && signal.quantity > 0) {
+        const trade = openTrade({
+          entryPrice: signal.price,
+          quantity: signal.quantity,
+          side: 'BUY',
+          stopLoss: null,
+          takeProfit: null,
+          timestamp,
+          symbol: paperState.symbol,
+          strategy: 'dca',
+          dcaLevel: signal.level,
+        });
+        addOpenTrade(portfolio, trade);
+        await tradePersistence.persistTradeOpen(trade, 'paper', paperState.symbol);
+        logger.signal('DCA level triggered', { level: signal.level, price: signal.price, quantity: signal.quantity });
+      }
+    }
+    // 3b. Execute new trade if BUY/SELL signal and no open position (non-DCA)
+    else if (['BUY', 'SELL'].includes(signal.signal) && portfolio.openTrades.length === 0) {
       const side = signal.signal;
       const tradesToday = getTradesToday(portfolio, timestamp);
       const lastClosed = portfolio.closedTrades[portfolio.closedTrades.length - 1];

@@ -96,10 +96,42 @@ async function getClosedTrades(mode = null) {
   return Trade.find(query).sort({ closedAt: 1 }).lean();
 }
 
+/**
+ * Bulk save closed trades (e.g. after backtest completes)
+ * @param {Array<Object>} trades - Closed trades with full data
+ * @param {string} mode - backtest | paper | real
+ * @param {string} symbol - Trading pair
+ * @returns {Promise<number>} Number of trades saved
+ */
+async function saveTradesBulk(trades, mode, symbol = 'BTC/USDT') {
+  if (!trades || trades.length === 0) return 0;
+
+  const docs = trades.map((t) => ({
+    mode,
+    symbol: t.symbol || symbol,
+    side: t.side,
+    entryPrice: t.entryPrice,
+    exitPrice: t.exitPrice,
+    quantity: t.quantity,
+    stopLoss: t.stopLoss ?? null,
+    takeProfit: t.takeProfit ?? null,
+    pnl: t.pnl ?? 0,
+    fees: (t.entryFee || 0) + (t.exitFee || 0),
+    status: 'CLOSED',
+    reason: t.reason || 'MANUAL',
+    sourceId: t.id,
+    closedAt: t.closedAt,
+  }));
+
+  const result = await Trade.insertMany(docs);
+  return result.length;
+}
+
 module.exports = {
   saveTrade,
   updateTrade,
   updateTradeByIdentifier,
   getTrades,
   getClosedTrades,
+  saveTradesBulk,
 };
