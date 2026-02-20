@@ -17,11 +17,11 @@ const tradeSchema = new mongoose.Schema(
     exitPrice: { type: Number, default: null },
     quantity: { type: Number, required: true },
     stopLoss: { type: Number, required: true },
-    takeProfit: { type: Number, required: true },
+    takeProfit: { type: Number, default: null }, // null for trailing-stop-only strategies
     pnl: { type: Number, default: 0 },
     fees: { type: Number, default: 0 },
     status: { type: String, required: true, enum: ['OPEN', 'CLOSED'], default: 'OPEN' },
-    reason: { type: String, enum: ['SL', 'TP', 'MANUAL', null], default: null },
+    reason: { type: String, enum: ['SL', 'TP', 'TE', 'MANUAL', null], default: null },
     orderId: { type: String, default: null },
     sourceId: { type: String, default: null }, // Execution engine trade id
     createdAt: { type: Date, default: Date.now },

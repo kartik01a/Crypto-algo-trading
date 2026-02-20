@@ -128,7 +128,8 @@ function checkExitConditions(trade, candle) {
   if (isStopLossHit(trade, low, high)) {
     return { exitPrice: trade.stopLoss, reason: 'STOP_LOSS' };
   }
-  if (isTakeProfitHit(trade, low, high)) {
+  // Only check TP if strategy provides one (some strategies use trailing stop only)
+  if (trade.takeProfit != null && trade.takeProfit !== Infinity && isTakeProfitHit(trade, low, high)) {
     return { exitPrice: trade.takeProfit, reason: 'TAKE_PROFIT' };
   }
 

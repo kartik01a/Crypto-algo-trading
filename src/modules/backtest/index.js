@@ -8,6 +8,11 @@ const { getSignal } = require('../strategy');
 const { canOpenTrade, getTradeRiskParams } = require('../risk');
 const { getTradeRiskParamsCustom } = require('../risk');
 const { applyTrendPullbackTrailingStop } = require('../strategy/trendPullbackStrategy');
+const {
+  applyTrendBreakoutTrailingStop,
+  TIME_EXIT_CANDLES,
+  COOLDOWN_CANDLES,
+} = require('../strategy/trendBreakoutStrategy');
 const { openTrade, closeTrade, checkExitConditions } = require('../execution');
 const {
   createPortfolio,
@@ -29,23 +34,33 @@ const logger = require('../../utils/logger');
  * @param {string} timeframe - Candle timeframe
  * @param {number} from - Start timestamp ms
  * @param {number} to - End timestamp ms
+ * @param {number} [maxCandles] - Max candles to fetch (safety cap, fetches most recent)
  * @returns {Promise<Array>} OHLCV data
  */
-async function fetchBacktestData(symbol, timeframe, from, to) {
+async function fetchBacktestData(symbol, timeframe, from, to, maxCandles = null) {
   const allCandles = [];
   let since = from;
+  let fetchCount = 0;
 
   while (since < to) {
-    const candles = await fetchOHLCV(symbol, timeframe, since, 1000);
+    if (maxCandles && allCandles.length >= maxCandles) break;
+
+    const limit = maxCandles ? Math.min(1000, maxCandles - allCandles.length) : 1000;
+    const candles = await fetchOHLCV(symbol, timeframe, since, limit);
     if (candles.length === 0) break;
 
     for (const c of candles) {
       if (c[0] >= from && c[0] <= to) {
         allCandles.push(c);
+        if (maxCandles && allCandles.length >= maxCandles) break;
       }
     }
 
     since = candles[candles.length - 1][0] + 1;
+    fetchCount += 1;
+    if (fetchCount % 10 === 0) {
+      logger.info(`[Backtest] Fetching data... ${allCandles.length} candles so far`);
+    }
     if (candles.length < 1000) break;
   }
 
@@ -72,6 +87,7 @@ async function runBacktest({
   ohlcv = null,
   strategy = null,
   debug = false,
+  limit = null, // Max candles to fetch (quick test); e.g. 10000
 }) {
   const fromTs = parseDate(from);
   const toTs = parseDate(to);
@@ -79,15 +95,17 @@ async function runBacktest({
   let candles = ohlcv;
   let htfCandles = null;
 
-  // For trendPullback we enforce MTF timeframes
-  const ltfTimeframe = strategy === 'trendPullback' ? '5m' : timeframe;
+  // For trendPullback/trendBreakout we use 5m for sufficient data
+  const ltfTimeframe = (strategy === 'trendPullback' || strategy === 'trendBreakout') ? '5m' : timeframe;
   const htfTimeframe = '15m';
 
   if (!candles || candles.length === 0) {
-    candles = await fetchBacktestData(symbol, ltfTimeframe, fromTs, toTs);
+    logger.info('[Backtest] Fetching OHLCV data...');
+    candles = await fetchBacktestData(symbol, ltfTimeframe, fromTs, toTs, limit);
+    logger.info(`[Backtest] Fetched ${candles.length} candles`);
   }
   if (strategy === 'trendPullback') {
-    htfCandles = await fetchBacktestData(symbol, htfTimeframe, fromTs, toTs);
+    htfCandles = await fetchBacktestData(symbol, htfTimeframe, fromTs, toTs, limit ? Math.ceil(limit / 3) : null);
   }
 
   if (candles.length === 0) {
@@ -98,9 +116,11 @@ async function runBacktest({
   // Backtest runs on historical timestamps; initialize daily reset anchor accordingly
   portfolio.lastDayReset = getStartOfDay(candles[0][0]);
   portfolio.dailyStartBalance = portfolio.balance;
-  const warmupPeriod = 50; // minimum candles before signal
+  const warmupPeriod = strategy === 'trendBreakout' ? 220 : 50; // trendBreakout needs EMA200 + ADX + lookback
   let lastTradeClosedAt = 0;
+  let candlesSinceLastLoss = Infinity; // Cooldown: wait 10 candles after losing trade
   let htfIdx = 0;
+  const tradesToPersist = []; // Collect for batch DB write at end
 
   const debugSummary = debug && strategy === 'trendPullback'
     ? {
@@ -146,9 +166,37 @@ async function runBacktest({
       });
     }
 
-    // 1. Check exit conditions for open trades (SL/TP)
+    if (strategy === 'trendBreakout' && portfolio.openTrades.length > 0 && i >= 1) {
+      const prevCandle = candles[i - 1];
+      const prevHigh = prevCandle[2];
+      const prevSlice = candles.slice(0, i);
+      const prevSignal = getSignal(prevSlice, { strategy: 'trendBreakout' });
+      const markPrice = prevSignal.price;
+      const atrNow = prevSignal.atr;
+
+      portfolio.openTrades = portfolio.openTrades.map((t) => {
+        if (t.strategy !== 'trendBreakout') return t;
+        const updated = applyTrendBreakoutTrailingStop(t, markPrice, prevHigh, atrNow);
+        updated.candleCount = (t.candleCount || 0) + 1;
+        return updated;
+      });
+    }
+
+    // 1. Check exit conditions for open trades (SL/TP, time exit)
     const tradesToClose = [];
     for (const trade of portfolio.openTrades) {
+      // Time exit: close if duration > 50 candles and profit < 1R (trendBreakout only)
+      if (strategy === 'trendBreakout' && trade.strategy === 'trendBreakout') {
+        const candleCount = trade.candleCount ?? 0;
+        const riskDist = trade.initialRiskDistance || Math.abs(trade.entryPrice - trade.stopLoss);
+        const profit = (close - trade.entryPrice) * (trade.side === 'BUY' ? 1 : -1);
+        const rMultiple = riskDist > 0 ? profit / riskDist : 0;
+        if (candleCount > TIME_EXIT_CANDLES && rMultiple < 1) {
+          tradesToClose.push({ trade, exitPrice: close, reason: 'TIME_EXIT' });
+          continue;
+        }
+      }
+
       const exitCheck = checkExitConditions(trade, candle);
       if (exitCheck) {
         tradesToClose.push({ trade, exitPrice: exitCheck.exitPrice, reason: exitCheck.reason });
@@ -157,9 +205,18 @@ async function runBacktest({
 
     for (const { trade, exitPrice, reason } of tradesToClose) {
       const closedTrade = closeTrade(trade, exitPrice, timestamp);
+      // MFE (max favorable excursion) in R multiples
+      const riskDist = trade.initialRiskDistance || Math.abs(trade.entryPrice - trade.stopLoss);
+      const highestPrice = Math.max(trade.highestPrice || trade.entryPrice, high);
+      closedTrade.mfe = riskDist > 0
+        ? roundTo(((highestPrice - trade.entryPrice) * (trade.side === 'BUY' ? 1 : -1)) / riskDist, 4)
+        : null;
       closeTradeInPortfolio(portfolio, closedTrade);
       lastTradeClosedAt = timestamp;
-      await tradePersistence.persistTradeClose(closedTrade, reason, 'backtest');
+      if (closedTrade.pnl < 0 && strategy === 'trendBreakout') {
+        candlesSinceLastLoss = 0;
+      }
+      tradesToPersist.push({ trade: closedTrade, reason });
     }
 
     // 2. Generate signal
@@ -173,7 +230,7 @@ async function runBacktest({
     }
 
     const signal = getSignal(ohlcvSlice, {
-      strategy: strategy === 'trendPullback' ? 'trendPullback' : undefined,
+      strategy: strategy === 'trendPullback' ? 'trendPullback' : strategy === 'trendBreakout' ? 'trendBreakout' : undefined,
       htfOhlcv: htfSlice,
     });
 
@@ -235,8 +292,14 @@ async function runBacktest({
       }
     }
 
+    // Cooldown: increment candles since last loss
+    if (strategy === 'trendBreakout') {
+      candlesSinceLastLoss = Math.min(candlesSinceLastLoss + 1, Infinity);
+    }
+
     // 3. Apply risk rules and execute new trade (BUY or SELL)
-    if (['BUY', 'SELL'].includes(signal.signal) && portfolio.openTrades.length === 0) {
+    const cooldownOk = strategy !== 'trendBreakout' || candlesSinceLastLoss >= COOLDOWN_CANDLES;
+    if (['BUY', 'SELL'].includes(signal.signal) && portfolio.openTrades.length === 0 && cooldownOk) {
       const side = signal.signal;
       if (debugSummary) debugSummary.entries.attempted += 1;
       const tradesToday = getTradesToday(portfolio, timestamp);
@@ -254,14 +317,27 @@ async function runBacktest({
       };
       const riskOverrides = strategy === 'trendPullback'
         ? { maxTradesPerDay: 2, tradeCooldownMs: 30 * 60 * 1000, now: timestamp }
-        : null;
+        : strategy === 'trendBreakout'
+          ? { maxTradesPerDay: 5, tradeCooldownMs: 60 * 60 * 1000, now: timestamp }
+          : null;
       const { allowed } = canOpenTrade(riskStateWithCooldown, riskOverrides);
       if (allowed) {
-        const riskParams = (strategy === 'trendPullback' && signal.stopLoss && signal.takeProfit)
-          ? getTradeRiskParamsCustom(signal.price, side, signal.stopLoss, signal.takeProfit, portfolio.balance)
+        const useCustomRisk = (strategy === 'trendPullback' && signal.stopLoss && signal.takeProfit)
+          || (strategy === 'trendBreakout' && signal.stopLoss);
+        const trendBreakoutRiskPct = 0.0175; // 1.75% risk (1.5-2% range)
+        const riskParams = useCustomRisk
+          ? getTradeRiskParamsCustom(
+              signal.price,
+              side,
+              signal.stopLoss,
+              signal.takeProfit ?? Infinity,
+              portfolio.balance,
+              strategy === 'trendBreakout' ? trendBreakoutRiskPct : null
+            )
           : getTradeRiskParams(signal.price, side, portfolio.balance);
 
         const { stopLoss, takeProfit, positionSize } = riskParams;
+        const effectiveTakeProfit = strategy === 'trendBreakout' ? null : takeProfit;
 
         if (positionSize > 0) {
           const trade = openTrade({
@@ -269,17 +345,17 @@ async function runBacktest({
             quantity: positionSize,
             side,
             stopLoss,
-            takeProfit,
+            takeProfit: effectiveTakeProfit,
             timestamp,
             symbol,
-            strategy: strategy === 'trendPullback' ? 'trendPullback' : 'default',
+            strategy: strategy === 'trendPullback' ? 'trendPullback' : strategy === 'trendBreakout' ? 'trendBreakout' : 'default',
             atrAtEntry: signal.atr,
             initialStopLoss: stopLoss,
             initialRiskDistance: Math.abs(signal.price - stopLoss),
+            breakoutStrength: signal.breakoutStrength ?? null,
           });
 
           addOpenTrade(portfolio, trade);
-          await tradePersistence.persistTradeOpen(trade, 'backtest', symbol);
           if (debugSummary) debugSummary.entries.opened += 1;
         } else if (debugSummary) {
           debugSummary.entries.blockedSize += 1;
@@ -302,11 +378,19 @@ async function runBacktest({
 
   for (const trade of [...portfolio.openTrades]) {
     const closedTrade = closeTrade(trade, lastClose, lastTimestamp);
+    const riskDist = trade.initialRiskDistance || Math.abs(trade.entryPrice - trade.stopLoss);
+    const highestPrice = Math.max(trade.highestPrice || trade.entryPrice, lastCandle[2]);
+    closedTrade.mfe = riskDist > 0
+      ? roundTo(((highestPrice - trade.entryPrice) * (trade.side === 'BUY' ? 1 : -1)) / riskDist, 4)
+      : null;
     closeTradeInPortfolio(portfolio, closedTrade);
-    await tradePersistence.persistTradeClose(closedTrade, 'MANUAL', 'backtest');
+    tradesToPersist.push({ trade: closedTrade, reason: 'MANUAL' });
   }
 
   updateEquityCurve(portfolio, lastTimestamp, lastClose);
+
+  // Batch persist all trades at end
+  await tradePersistence.persistBacktestTradesBulk(tradesToPersist, symbol);
 
   // Calculate metrics and drawdown curve
   const summary = getSummary(portfolio);
@@ -324,6 +408,18 @@ async function runBacktest({
 
   const profitFactor = grossLoss > 0 ? roundTo(grossProfit / grossLoss, 4) : grossProfit > 0 ? Infinity : 0;
 
+  // R-multiple, avgWin, avgLoss, expectancy (for strategy evaluation)
+  const tradesWithR = closedTrades.filter((t) => t.initialRiskDistance && t.initialRiskDistance > 0);
+  const rMultiples = tradesWithR.map((t) => t.pnl / (t.initialRiskDistance * t.quantity));
+  const avgRMultiple = rMultiples.length > 0
+    ? roundTo(rMultiples.reduce((a, b) => a + b, 0) / rMultiples.length, 4)
+    : null;
+  const avgWin = winningTrades.length > 0 ? roundTo(grossProfit / winningTrades.length, 8) : 0;
+  const avgLoss = losingTrades.length > 0 ? roundTo(grossLoss / losingTrades.length, 8) : 0;
+  const expectancy = closedTrades.length > 0
+    ? roundTo((winningTrades.length / closedTrades.length) * avgWin - (losingTrades.length / closedTrades.length) * avgLoss, 8)
+    : 0;
+
   // Build drawdown curve from equity curve
   const drawdownCurve = [];
   let peak = portfolio.initialBalance;
@@ -334,16 +430,31 @@ async function runBacktest({
     drawdownCurve.push({ timestamp: point.timestamp, drawdown: roundTo(drawdown, 4), equity });
   }
 
-  // Trade list for response
-  const tradeList = closedTrades.map((t) => ({
-    entryPrice: t.entryPrice,
-    exitPrice: t.exitPrice,
-    quantity: t.quantity,
-    pnl: t.pnl,
-    status: t.status,
-    openedAt: t.openedAt,
-    closedAt: t.closedAt,
-  }));
+  // Trade list for response (with R-multiple, MFE when available)
+  const tradeList = closedTrades.map((t) => {
+    const riskAmount = t.initialRiskDistance && t.initialRiskDistance > 0
+      ? t.initialRiskDistance * t.quantity
+      : null;
+    const rMultiple = riskAmount ? roundTo(t.pnl / riskAmount, 4) : null;
+    return {
+      entryPrice: t.entryPrice,
+      exitPrice: t.exitPrice,
+      quantity: t.quantity,
+      pnl: t.pnl,
+      rMultiple,
+      mfe: t.mfe ?? null,
+      breakoutStrength: t.breakoutStrength ?? null,
+      status: t.status,
+      openedAt: t.openedAt,
+      closedAt: t.closedAt,
+    };
+  });
+
+  // Avg MFE for strategy evaluation
+  const tradesWithMfe = closedTrades.filter((t) => t.mfe != null);
+  const avgMfe = tradesWithMfe.length > 0
+    ? roundTo(tradesWithMfe.reduce((a, t) => a + t.mfe, 0) / tradesWithMfe.length, 4)
+    : null;
 
   return {
     finalBalance: summary.balance,
@@ -354,6 +465,11 @@ async function runBacktest({
     maxDrawdown: summary.maxDrawdown,
     totalPnl: summary.totalPnl,
     totalPnlPercent: summary.totalPnlPercent,
+    avgWin,
+    avgLoss,
+    expectancy,
+    avgRMultiple,
+    avgMfe,
     equityCurve: portfolio.equityCurve,
     drawdownCurve,
     tradeList,
@@ -361,7 +477,10 @@ async function runBacktest({
       strategy: strategy || 'default',
       ltfTimeframe,
       htfTimeframe: strategy === 'trendPullback' ? htfTimeframe : null,
-      candles: { ltf: candles.length, htf: strategy === 'trendPullback' ? (htfCandles ? htfCandles.length : 0) : null },
+      candles: {
+        ltf: candles.length,
+        htf: strategy === 'trendPullback' ? (htfCandles ? htfCandles.length : 0) : null,
+      },
     },
     debugSummary: debugSummary || undefined,
   };

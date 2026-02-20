@@ -142,10 +142,12 @@ function calculatePositionSize(balance, entryPrice, side) {
  * @param {number} balance - Current balance
  * @param {number} entryPrice - Entry price
  * @param {number} stopLoss - Stop loss price
+ * @param {number} [riskPercentOverride] - Override risk per trade (e.g. 0.015 for 1.5%)
  * @returns {number} Position size in base currency
  */
-function calculatePositionSizeWithStop(balance, entryPrice, stopLoss) {
-  const riskAmount = balance * riskPerTrade;
+function calculatePositionSizeWithStop(balance, entryPrice, stopLoss, riskPercentOverride = null) {
+  const riskPct = riskPercentOverride != null ? riskPercentOverride : riskPerTrade;
+  const riskAmount = balance * riskPct;
   const stopLossDistance = Math.abs(entryPrice - stopLoss);
   if (!stopLossDistance || stopLossDistance <= 0) return 0;
   const positionSize = riskAmount / stopLossDistance;
@@ -174,12 +176,13 @@ function getTradeRiskParams(entryPrice, side, balance) {
  * @param {number} stopLoss
  * @param {number} takeProfit
  * @param {number} balance
+ * @param {number} [riskPercentOverride] - Override risk per trade (e.g. 0.018 for 1.8%)
  */
-function getTradeRiskParamsCustom(entryPrice, side, stopLoss, takeProfit, balance) {
+function getTradeRiskParamsCustom(entryPrice, side, stopLoss, takeProfit, balance, riskPercentOverride = null) {
   return {
     stopLoss,
     takeProfit,
-    positionSize: calculatePositionSizeWithStop(balance, entryPrice, stopLoss),
+    positionSize: calculatePositionSizeWithStop(balance, entryPrice, stopLoss, riskPercentOverride),
     side,
   };
 }

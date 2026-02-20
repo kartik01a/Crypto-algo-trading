@@ -64,6 +64,29 @@ function addOpenTrade(portfolio, trade) {
 }
 
 /**
+ * Add to existing position (pyramiding)
+ * @param {Object} portfolio - Portfolio state
+ * @param {Object} trade - Existing trade to add to
+ * @param {number} addQuantity - Additional quantity to add
+ * @param {number} addPrice - Price at which to add
+ * @param {number} addFee - Fee for the add
+ */
+function addToPosition(portfolio, trade, addQuantity, addPrice, addFee = 0) {
+  const idx = portfolio.openTrades.findIndex((t) => t.id === trade.id);
+  if (idx < 0) return;
+
+  const cost = trade.side === 'BUY'
+    ? (addPrice * addQuantity + addFee)
+    : -(addPrice * addQuantity - addFee);
+  portfolio.balance = roundTo(portfolio.balance - cost, 8);
+
+  const t = portfolio.openTrades[idx];
+  t.quantity = roundTo(t.quantity + addQuantity, 8);
+  t.entryFee = (t.entryFee || 0) + addFee;
+  updateEquityCurve(portfolio);
+}
+
+/**
  * Remove open trade and add to closed
  * @param {Object} portfolio - Portfolio state
  * @param {Object} trade - Closed trade (with exitPrice, quantity, exitFee)
@@ -140,6 +163,7 @@ module.exports = {
   resetDailyIfNeeded,
   getTradesToday,
   addOpenTrade,
+  addToPosition,
   closeTradeInPortfolio,
   updateEquityCurve,
   getSummary,

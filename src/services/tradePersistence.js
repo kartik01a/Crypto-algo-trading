@@ -47,8 +47,31 @@ async function persistTradeClose(trade, reason, mode) {
   }
 }
 
+/**
+ * Persist all backtest trades in one bulk insert at the end
+ * @param {Array<{trade:Object, reason:string}>} closedTradesWithReason - Closed trades with close reason
+ * @param {string} symbol - Trading pair
+ */
+async function persistBacktestTradesBulk(closedTradesWithReason, symbol = 'BTC/USDT') {
+  if (!dbAvailable || !closedTradesWithReason?.length) return null;
+
+  try {
+    const result = await tradeRepository.saveClosedTradesBulk(
+      closedTradesWithReason,
+      'backtest',
+      symbol
+    );
+    logger.trade('Backtest trades saved to DB', { count: result.length, mode: 'backtest' });
+    return result.length;
+  } catch (err) {
+    logger.error('Failed to persist backtest trades', { error: err.message });
+    return null;
+  }
+}
+
 module.exports = {
   setDbAvailable,
   persistTradeOpen,
   persistTradeClose,
+  persistBacktestTradesBulk,
 };
