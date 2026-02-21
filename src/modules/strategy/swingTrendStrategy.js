@@ -128,18 +128,19 @@ function getHtfMetrics(htfOhlcv) {
 function calculateBuyScore(htfMetrics, ltfPrice, ltfEma50, rsi, adx, atrPercent, close, open, currentLow, prevLow) {
   let score = 0;
   if (!htfMetrics) return 0;
+  const cfg = getConfig();
 
   const { htfClose, htfEma50, htfEma200 } = htfMetrics;
 
   // TREND
   if (htfClose > htfEma200) score += 2;
   if (htfEma50 > htfEma200) score += 2;
-  if (adx != null && adx > 20) score += 1;
+  if (adx != null && adx > cfg.adxMin) score += 1;
 
   // PULLBACK
   const distanceFromEma = ltfEma50 != null ? Math.abs(ltfPrice - ltfEma50) / ltfPrice : 1;
   if (distanceFromEma < PULLBACK_DISTANCE) score += 2;
-  if (rsi != null && rsi >= 40 && rsi <= 55) score += 1;
+  if (rsi != null && rsi >= 40 && rsi <= 50) score += 1;
 
   // MOMENTUM
   if (close > open) score += 1;
@@ -149,7 +150,7 @@ function calculateBuyScore(htfMetrics, ltfPrice, ltfEma50, rsi, adx, atrPercent,
   if (atrPercent > 0.5) score += 1;
 
   // STRONG TREND BONUS
-  if (adx != null && adx > 25) score += 1;
+  if (adx != null && adx > cfg.adxStrongThreshold) score += 1;
 
   return score;
 }
@@ -160,13 +161,14 @@ function calculateBuyScore(htfMetrics, ltfPrice, ltfEma50, rsi, adx, atrPercent,
 function calculateSellScore(htfMetrics, ltfPrice, ltfEma50, rsi, adx, atrPercent, close, open, currentHigh, prevHigh) {
   let score = 0;
   if (!htfMetrics) return 0;
+  const cfg = getConfig();
 
   const { htfClose, htfEma50, htfEma200 } = htfMetrics;
 
   // TREND (bearish)
   if (htfClose < htfEma200) score += 2;
   if (htfEma50 < htfEma200) score += 2;
-  if (adx != null && adx > 20) score += 1;
+  if (adx != null && adx > cfg.adxMin) score += 1;
 
   // PULLBACK (price near EMA50 for short)
   const distanceFromEma = ltfEma50 != null ? Math.abs(ltfPrice - ltfEma50) / ltfPrice : 1;
@@ -181,7 +183,7 @@ function calculateSellScore(htfMetrics, ltfPrice, ltfEma50, rsi, adx, atrPercent
   if (atrPercent > 0.5) score += 1;
 
   // STRONG TREND BONUS
-  if (adx != null && adx > 25) score += 1;
+  if (adx != null && adx > cfg.adxStrongThreshold) score += 1;
 
   return score;
 }

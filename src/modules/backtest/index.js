@@ -14,13 +14,25 @@ const {
   logTradeMetrics,
   COOLDOWN_CANDLES,
 } = require('../strategy/swingTrendStrategy');
-const { openTrade, closeTrade, checkExitConditions } = require('../execution');
+const {
+  shouldExitTrade: dmaTrendShouldExitTrade,
+  updateTrailingStop: dmaTrendUpdateTrailingStop,
+  logTradeMetrics: dmaTrendLogTradeMetrics,
+} = require('../strategy/dmaTrendStrategy');
+const {
+  shouldExitTrade: momentumTrailingShouldExitTrade,
+  updateTrailingStop: momentumTrailingUpdateTrailingStop,
+  checkPartialTakeProfit: momentumTrailingCheckPartialTakeProfit,
+  logTradeMetrics: momentumTrailingLogTradeMetrics,
+} = require('../strategy/momentumTrailingStrategy');
+const { openTrade, closeTrade, closePartialTrade, checkExitConditions } = require('../execution');
 const {
   createPortfolio,
   resetDailyIfNeeded,
   getTradesToday,
   addOpenTrade,
   closeTradeInPortfolio,
+  partialCloseTradeInPortfolio,
   updateEquityCurve,
   getSummary,
 } = require('../portfolio');
@@ -86,16 +98,20 @@ async function runBacktest({
 
   // Multi-symbol: use symbols array; single-symbol: use symbol
   const symbols = symbolsParam && symbolsParam.length > 0 ? symbolsParam : [symbol || 'BTC/USDT'];
-  const isMultiSymbol = strategy === 'swingTrend' && symbols.length > 1;
+  const isMultiSymbol = (strategy === 'swingTrend' || strategy === 'dmaTrend') && symbols.length > 1;
 
   let candles = ohlcv;
   let htfCandles = null;
   let candlesBySymbol = null;
   let htfCandlesBySymbol = null;
 
-  // For trendPullback we enforce 5m+15m; for swingTrend we enforce 4h+1d
-  const ltfTimeframe = strategy === 'swingTrend' ? '4h' : strategy === 'trendPullback' ? '5m' : timeframe;
-  const htfTimeframe = strategy === 'swingTrend' ? '1d' : '15m';
+  // For trendPullback we enforce 5m+15m; for swingTrend/dmaTrend we enforce 4h+1d; momentumTrailing uses 4h only
+  const ltfTimeframe = strategy === 'swingTrend' || strategy === 'dmaTrend' || strategy === 'momentumTrailing'
+    ? '4h'
+    : strategy === 'trendPullback'
+      ? '5m'
+      : timeframe;
+  const htfTimeframe = strategy === 'swingTrend' || strategy === 'dmaTrend' ? '1d' : '15m';
 
   if (isMultiSymbol) {
     // Fetch LTF and HTF for each symbol
@@ -116,9 +132,9 @@ async function runBacktest({
     if (!candles || candles.length === 0) {
       candles = await fetchBacktestData(symbols[0], ltfTimeframe, fromTs, toTs);
     }
-    if (strategy === 'trendPullback' || strategy === 'swingTrend') {
+    if (strategy === 'trendPullback' || strategy === 'swingTrend' || strategy === 'dmaTrend') {
       let htfFrom = fromTs;
-      if (strategy === 'swingTrend' && htfTimeframe === '1d') {
+      if ((strategy === 'swingTrend' || strategy === 'dmaTrend') && htfTimeframe === '1d') {
         const WARMUP_DAYS_MS = 250 * 24 * 60 * 60 * 1000;
         htfFrom = Math.max(0, fromTs - WARMUP_DAYS_MS);
       }
@@ -134,7 +150,11 @@ async function runBacktest({
   // Backtest runs on historical timestamps; initialize daily reset anchor accordingly
   portfolio.lastDayReset = getStartOfDay(candles[0][0]);
   portfolio.dailyStartBalance = portfolio.balance;
-  const warmupPeriod = strategy === 'swingTrend' ? 220 : 50; // swingTrend needs EMA200
+  const warmupPeriod = strategy === 'swingTrend' || strategy === 'dmaTrend'
+    ? 220
+    : strategy === 'momentumTrailing'
+      ? 60
+      : 50; // swingTrend/dmaTrend need EMA200/SMA200; momentumTrailing needs EMA50 + buffer
   let lastTradeClosedAt = 0;
   let candlesSinceLastLoss = Infinity; // Cooldown for swingTrend
   let htfIdx = 0;
@@ -221,6 +241,86 @@ async function runBacktest({
       });
     }
 
+    if (strategy === 'dmaTrend' && portfolio.openTrades.length > 0 && i >= 1) {
+      portfolio.openTrades = portfolio.openTrades.map((t) => {
+        if (t.strategy !== 'dmaTrend') return t;
+        const sym = t.symbol || symbols[0];
+        const symCandles = isMultiSymbol ? candlesBySymbol[sym] : candles;
+        const prevCandle = symCandles[i - 1];
+        const prevHigh = prevCandle[2];
+        const prevLow = prevCandle[3];
+        const prevSlice = symCandles.slice(0, i);
+        const symHtf = isMultiSymbol ? htfCandlesBySymbol[sym] : htfCandles;
+        let prevHtfSlice = null;
+        if (symHtf) {
+          let idx = isMultiSymbol ? htfIdxBySymbol[sym] : htfIdx;
+          while (idx < symHtf.length - 1 && symHtf[idx + 1][0] <= prevCandle[0]) idx += 1;
+          prevHtfSlice = symHtf.slice(0, idx + 1);
+        }
+        const prevSignal = getSignal(prevSlice, {
+          strategy: 'dmaTrend',
+          htfOhlcv: prevHtfSlice,
+          openTrades: portfolio.openTrades,
+          symbol: sym,
+        });
+        const markPrice = prevSignal.price;
+        const atrNow = prevSignal.atr;
+        return dmaTrendUpdateTrailingStop(t, markPrice, atrNow, prevHigh, prevLow);
+      });
+    }
+
+    if (strategy === 'momentumTrailing' && portfolio.openTrades.length > 0 && i >= 1) {
+      portfolio.openTrades = portfolio.openTrades.map((t) => {
+        if (t.strategy !== 'momentumTrailing') return t;
+        const sym = t.symbol || symbols[0];
+        const symCandles = isMultiSymbol ? candlesBySymbol[sym] : candles;
+        const prevCandle = symCandles[i - 1];
+        const prevHigh = prevCandle[2];
+        const prevLow = prevCandle[3];
+        const prevSlice = symCandles.slice(0, i);
+        const prevSignal = getSignal(prevSlice, {
+          strategy: 'momentumTrailing',
+          openTrades: portfolio.openTrades,
+        });
+        const markPrice = prevSignal.price;
+        const atrNow = prevSignal.atr;
+        return momentumTrailingUpdateTrailingStop(t, markPrice, atrNow, prevHigh, prevLow);
+      });
+    }
+
+    // 0.5. Check partial take profit for momentumTrailing (before exit check)
+    if (strategy === 'momentumTrailing') {
+      for (let ti = 0; ti < portfolio.openTrades.length; ti++) {
+        const trade = portfolio.openTrades[ti];
+        if (trade.strategy !== 'momentumTrailing') continue;
+        const tradeCandle = isMultiSymbol && trade.symbol ? candlesBySymbol[trade.symbol][i] : candle;
+        const partialResult = momentumTrailingCheckPartialTakeProfit(trade, tradeCandle);
+        if (partialResult && partialResult.partialClose) {
+          const { closedPart, updatedTrade } = closePartialTrade(
+            trade,
+            partialResult.exitPrice,
+            timestamp,
+            partialResult.closePercent
+          );
+          const updatedWithFlag = { ...updatedTrade, partialTPTriggered: true };
+          partialCloseTradeInPortfolio(portfolio, { ...closedPart, exitReason: 'PARTIAL_TP' }, updatedWithFlag);
+          lastTradeClosedAt = timestamp;
+          const riskDist = trade.initialRiskDistance || Math.abs(trade.entryPrice - trade.stopLoss);
+          const rMultiple = riskDist > 0 && closedPart.quantity > 0
+            ? roundTo(closedPart.pnl / (riskDist * closedPart.quantity), 4)
+            : null;
+          logger.trade('MomentumTrailing partial close', {
+            tradeId: trade.id,
+            closedQty: closedPart.quantity,
+            remainingQty: updatedWithFlag.quantity,
+            pnl: closedPart.pnl,
+            rMultiple,
+          });
+          await tradePersistence.persistTradeClose(closedPart, 'PARTIAL_TP', 'backtest');
+        }
+      }
+    }
+
     // 1. Check exit conditions for open trades (SL/TP)
     const tradesToClose = [];
     for (const trade of portfolio.openTrades) {
@@ -248,6 +348,38 @@ async function runBacktest({
         if (exitCheck) {
           tradesToClose.push({ trade, exitPrice: exitCheck.exitPrice, reason: exitCheck.reason });
         }
+      } else if (strategy === 'dmaTrend' && trade.strategy === 'dmaTrend') {
+        const sym = trade.symbol || symbols[0];
+        const symCandles = isMultiSymbol ? candlesBySymbol[sym] : candles;
+        const symHtf = isMultiSymbol ? htfCandlesBySymbol[sym] : htfCandles;
+        const sliceForExit = symCandles.slice(0, i + 1);
+        const prevCandle = i >= 1 ? symCandles[i - 1] : null;
+        const prevClose = prevCandle ? prevCandle[4] : null;
+        const signal = getSignal(sliceForExit, {
+          strategy: 'dmaTrend',
+          htfOhlcv: symHtf || [],
+          openTrades: portfolio.openTrades,
+          symbol: sym,
+        });
+        const exitCheck = dmaTrendShouldExitTrade(trade, tradeCandle, signal.atr, {
+          sma200: signal.sma200,
+          prevClose,
+        });
+        if (exitCheck) {
+          tradesToClose.push({ trade, exitPrice: exitCheck.exitPrice, reason: exitCheck.reason });
+        }
+      } else if (strategy === 'momentumTrailing' && trade.strategy === 'momentumTrailing') {
+        const sym = trade.symbol || symbols[0];
+        const symCandles = isMultiSymbol ? candlesBySymbol[sym] : candles;
+        const sliceForExit = symCandles.slice(0, i + 1);
+        const signal = getSignal(sliceForExit, {
+          strategy: 'momentumTrailing',
+          openTrades: portfolio.openTrades,
+        });
+        const exitCheck = momentumTrailingShouldExitTrade(trade, tradeCandle, signal.atr, {});
+        if (exitCheck) {
+          tradesToClose.push({ trade, exitPrice: exitCheck.exitPrice, reason: exitCheck.reason });
+        }
       } else {
         const exitCheck = checkExitConditions(trade, tradeCandle);
         if (exitCheck) {
@@ -270,11 +402,25 @@ async function runBacktest({
           : null;
         logger.trade('SwingTrend trade closed', { tradeId: trade.id, reason, pnl: closedTrade.pnl, rMultiple });
       }
+      if (strategy === 'dmaTrend' && trade.strategy === 'dmaTrend') {
+        const riskDist = trade.initialRiskDistance || Math.abs(trade.entryPrice - trade.stopLoss);
+        const rMultiple = riskDist > 0 && trade.quantity > 0
+          ? roundTo(closedTrade.pnl / (riskDist * trade.quantity), 4)
+          : null;
+        logger.trade('DMA Trend trade closed', { tradeId: trade.id, reason, pnl: closedTrade.pnl, rMultiple });
+      }
+      if (strategy === 'momentumTrailing' && trade.strategy === 'momentumTrailing') {
+        const riskDist = trade.initialRiskDistance || Math.abs(trade.entryPrice - trade.stopLoss);
+        const rMultiple = riskDist > 0 && trade.quantity > 0
+          ? roundTo(closedTrade.pnl / (riskDist * trade.quantity), 4)
+          : null;
+        logger.trade('MomentumTrailing trade closed', { tradeId: trade.id, reason, pnl: closedTrade.pnl, rMultiple });
+      }
       await tradePersistence.persistTradeClose(closedTrade, reason, 'backtest');
     }
 
     // 2. Generate signal (single-symbol) or collect & rank signals (multi-symbol)
-    if (strategy === 'trendPullback' || strategy === 'swingTrend') {
+    if (strategy === 'trendPullback' || strategy === 'swingTrend' || strategy === 'dmaTrend' || strategy === 'momentumTrailing') {
       if (isMultiSymbol) {
         for (const sym of symbols) {
           while (htfCandlesBySymbol[sym] && htfIdxBySymbol[sym] < htfCandlesBySymbol[sym].length - 1
@@ -314,14 +460,34 @@ async function runBacktest({
       const available = allSignals.filter((s) => !openSymbols.has(s.symbol));
       const topSignals = available.slice(0, 2 - portfolio.openTrades.length);
       signal = { topSignals, primary: topSignals[0] || { signal: 'HOLD', price: close, timestamp } };
+    } else if (isMultiSymbol && strategy === 'dmaTrend') {
+      const allSignals = [];
+      for (const sym of symbols) {
+        const symCandles = candlesBySymbol[sym];
+        const symHtf = htfCandlesBySymbol[sym];
+        const symSlice = symCandles.slice(0, i + 1);
+        const s = getSignal(symSlice, {
+          strategy: 'dmaTrend',
+          htfOhlcv: symHtf || [],
+          openTrades: portfolio.openTrades,
+          symbol: sym,
+        });
+        if (['BUY', 'SELL'].includes(s.signal)) {
+          allSignals.push({ ...s, symbol: sym });
+        }
+      }
+      const available = allSignals.filter((s) => !openSymbols.has(s.symbol));
+      const topSignals = available.slice(0, 2 - portfolio.openTrades.length);
+      signal = { topSignals, primary: topSignals[0] || { signal: 'HOLD', price: close, timestamp } };
     } else {
-      const htfSlice = !isMultiSymbol && (strategy === 'trendPullback' || strategy === 'swingTrend')
-        ? (htfCandles ? htfCandles.slice(0, htfIdx + 1) : [])
+      // dmaTrend clips to closed daily internally; pass full htfCandles; momentumTrailing uses LTF only
+      const htfSlice = !isMultiSymbol && (strategy === 'trendPullback' || strategy === 'swingTrend' || strategy === 'dmaTrend')
+        ? (htfCandles ? (strategy === 'dmaTrend' ? htfCandles : htfCandles.slice(0, htfIdx + 1)) : [])
         : [];
       signal = getSignal(ohlcvSlice, {
-        strategy: strategy === 'trendPullback' ? 'trendPullback' : strategy === 'swingTrend' ? 'swingTrend' : undefined,
+        strategy: strategy === 'trendPullback' ? 'trendPullback' : strategy === 'swingTrend' ? 'swingTrend' : strategy === 'dmaTrend' ? 'dmaTrend' : strategy === 'momentumTrailing' ? 'momentumTrailing' : undefined,
         htfOhlcv: htfSlice,
-        openTrades: strategy === 'swingTrend' ? portfolio.openTrades : undefined,
+        openTrades: (strategy === 'swingTrend' || strategy === 'dmaTrend' || strategy === 'momentumTrailing') ? portfolio.openTrades : undefined,
       });
     }
 
@@ -390,8 +556,8 @@ async function runBacktest({
 
     // 3. Apply risk rules and execute new trade(s) (BUY or SELL)
     const cooldownOk = strategy !== 'swingTrend' || candlesSinceLastLoss >= COOLDOWN_CANDLES;
-    const maxOpenOk = strategy !== 'swingTrend' || portfolio.openTrades.length < 2;
-    const maxNewTrades = strategy === 'swingTrend' ? 2 - portfolio.openTrades.length : 1;
+    const maxOpenOk = (strategy !== 'swingTrend' && strategy !== 'dmaTrend' && strategy !== 'momentumTrailing') || portfolio.openTrades.length < 2;
+    const maxNewTrades = (strategy === 'swingTrend' || strategy === 'dmaTrend' || strategy === 'momentumTrailing') ? 2 - portfolio.openTrades.length : 1;
     const signalsToOpen = isMultiSymbol && signal.topSignals
       ? signal.topSignals.slice(0, maxNewTrades)
       : (['BUY', 'SELL'].includes(signal.signal) ? [signal] : []);
@@ -420,25 +586,30 @@ async function runBacktest({
           ? { maxTradesPerDay: 2, tradeCooldownMs: 30 * 60 * 1000, now: timestamp }
           : strategy === 'swingTrend'
             ? { maxTradesPerDay: 2, tradeCooldownMs: 0, now: timestamp }
-            : null;
+            : strategy === 'dmaTrend'
+              ? { maxTradesPerDay: 3, tradeCooldownMs: 0, now: timestamp }
+              : strategy === 'momentumTrailing'
+                ? { maxTradesPerDay: 5, tradeCooldownMs: 0, now: timestamp }
+                : null;
         const { allowed } = canOpenTrade(riskStateWithCooldown, riskOverrides);
         if (allowed) {
           const useCustomRisk =
             (strategy === 'trendPullback' && sig.stopLoss && sig.takeProfit) ||
-            (strategy === 'swingTrend' && sig.stopLoss);
+            (strategy === 'swingTrend' && sig.stopLoss) ||
+            (strategy === 'dmaTrend' && sig.stopLoss) ||
+            (strategy === 'momentumTrailing' && sig.stopLoss);
           const riskParams = useCustomRisk
             ? getTradeRiskParamsCustom(
                 sig.price,
                 side,
                 sig.stopLoss,
                 sig.takeProfit || Infinity,
-                portfolio.balance,
-                strategy === 'swingTrend' ? (sig.suggestedRiskPercent ?? 0.01) : null
+                portfolio.balance
               )
             : getTradeRiskParams(sig.price, side, portfolio.balance);
 
           const { stopLoss, takeProfit, positionSize } = riskParams;
-          const effectiveTakeProfit = strategy === 'swingTrend' ? null : takeProfit;
+          const effectiveTakeProfit = (strategy === 'swingTrend' || strategy === 'dmaTrend' || strategy === 'momentumTrailing') ? null : takeProfit;
 
           if (positionSize > 0) {
             const trade = openTrade({
@@ -449,12 +620,18 @@ async function runBacktest({
               takeProfit: effectiveTakeProfit,
               timestamp,
               symbol: tradeSymbol,
-              strategy: strategy === 'trendPullback' ? 'trendPullback' : strategy === 'swingTrend' ? 'swingTrend' : 'default',
+              strategy: strategy === 'trendPullback' ? 'trendPullback' : strategy === 'swingTrend' ? 'swingTrend' : strategy === 'dmaTrend' ? 'dmaTrend' : strategy === 'momentumTrailing' ? 'momentumTrailing' : 'default',
               atrAtEntry: sig.atr,
               initialStopLoss: stopLoss,
               initialRiskDistance: Math.abs(sig.price - stopLoss),
-              takeProfit: strategy === 'swingTrend' ? sig.takeProfit : undefined,
+              takeProfit: (strategy === 'swingTrend' || strategy === 'dmaTrend') ? sig.takeProfit : undefined,
               score: strategy === 'swingTrend' ? sig.score : undefined,
+              entryReason: strategy === 'momentumTrailing' ? sig.entryReason : undefined,
+              highestPrice: strategy === 'momentumTrailing' ? sig.price : undefined,
+              lowestPrice: strategy === 'momentumTrailing' ? sig.price : undefined,
+              trailingActive: strategy === 'momentumTrailing' ? false : undefined,
+              breakevenTriggered: strategy === 'momentumTrailing' ? false : undefined,
+              partialTPTriggered: strategy === 'momentumTrailing' ? false : undefined,
             });
 
             addOpenTrade(portfolio, trade);
@@ -516,6 +693,12 @@ async function runBacktest({
   if (strategy === 'swingTrend' && closedTrades.length > 0) {
     logTradeMetrics(closedTrades);
   }
+  if (strategy === 'dmaTrend' && closedTrades.length > 0) {
+    dmaTrendLogTradeMetrics(closedTrades);
+  }
+  if (strategy === 'momentumTrailing' && closedTrades.length > 0) {
+    momentumTrailingLogTradeMetrics(closedTrades);
+  }
 
   // Build drawdown curve from equity curve
   const drawdownCurve = [];
@@ -555,10 +738,10 @@ async function runBacktest({
       strategy: strategy || 'default',
       symbols: isMultiSymbol ? symbols : [symbols[0]],
       ltfTimeframe,
-      htfTimeframe: (strategy === 'trendPullback' || strategy === 'swingTrend') ? htfTimeframe : null,
+      htfTimeframe: (strategy === 'trendPullback' || strategy === 'swingTrend' || strategy === 'dmaTrend') ? htfTimeframe : null,
       candles: {
         ltf: candles.length,
-        htf: (strategy === 'trendPullback' || strategy === 'swingTrend')
+        htf: (strategy === 'trendPullback' || strategy === 'swingTrend' || strategy === 'dmaTrend')
           ? (isMultiSymbol ? (htfCandlesBySymbol?.[symbols[0]]?.length ?? 0) : (htfCandles?.length ?? 0))
           : null,
       },

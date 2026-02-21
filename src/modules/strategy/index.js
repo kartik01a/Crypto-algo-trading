@@ -10,6 +10,8 @@ const { EMA, RSI, ATR } = require('technicalindicators');
 const config = require('../../config');
 const { trendPullbackStrategy } = require('./trendPullbackStrategy');
 const { swingTrendStrategy } = require('./swingTrendStrategy');
+const { dmaTrendStrategy } = require('./dmaTrendStrategy');
+const { momentumTrailingStrategy } = require('./momentumTrailingStrategy');
 
 const {
   emaShort,
@@ -186,6 +188,20 @@ module.exports = {
           openTrades: options.openTrades || [],
         });
       }
+      if (options.strategy === 'dmaTrend') {
+        return dmaTrendStrategy({
+          ltfOhlcv: ohlcvHistory,
+          htfOhlcv: options.htfOhlcv || [],
+          openTrades: options.openTrades || [],
+          symbol: options.symbol || null,
+        });
+      }
+      if (options.strategy === 'momentumTrailing') {
+        return momentumTrailingStrategy({
+          ltfOhlcv: ohlcvHistory,
+          openTrades: options.openTrades || [],
+        });
+      }
       return generateSignal(ohlcvHistory);
     } catch (err) {
       return {
@@ -204,4 +220,6 @@ module.exports = {
   applyTrendFilter,
   trendPullbackStrategy,
   swingTrendStrategy,
+  dmaTrendStrategy,
+  momentumTrailingStrategy,
 };

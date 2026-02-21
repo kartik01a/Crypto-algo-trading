@@ -45,6 +45,23 @@ module.exports = {
       atrPercentMin: 0.5,
       earlyExitRThreshold: -0.5,
     },
+    // DMA Trend strategy (Daily SMA200 crossover)
+    dmaTrend: {
+      atrMultiplier: 2,
+      takeProfitRR: 3,
+      adxThreshold: 20,
+      entryTimeframe: '4h',
+    },
+    // Momentum Trailing strategy (activation-based trailing stop)
+    momentumTrailing: {
+      momentumLength: 12,
+      activationPercent: 0.01,
+      trailingPercent: 0.005,
+      atrMultiplier: 1.5,
+      breakevenRR: 2,
+      partialTPRR: 3,
+      partialClosePercent: 0.5,
+    },
   },
 
   // Risk management defaults
