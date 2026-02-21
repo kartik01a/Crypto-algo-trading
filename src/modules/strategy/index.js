@@ -9,6 +9,7 @@
 const { EMA, RSI, ATR } = require('technicalindicators');
 const config = require('../../config');
 const { trendPullbackStrategy } = require('./trendPullbackStrategy');
+const { swingTrendStrategy } = require('./swingTrendStrategy');
 
 const {
   emaShort,
@@ -178,6 +179,13 @@ module.exports = {
           htfOhlcv: options.htfOhlcv || [],
         });
       }
+      if (options.strategy === 'swingTrend') {
+        return swingTrendStrategy({
+          ltfOhlcv: ohlcvHistory,
+          htfOhlcv: options.htfOhlcv || [],
+          openTrades: options.openTrades || [],
+        });
+      }
       return generateSignal(ohlcvHistory);
     } catch (err) {
       return {
@@ -195,4 +203,5 @@ module.exports = {
   applyATRFilter,
   applyTrendFilter,
   trendPullbackStrategy,
+  swingTrendStrategy,
 };

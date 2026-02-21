@@ -89,14 +89,50 @@ function closeTradeInPortfolio(portfolio, trade) {
 }
 
 /**
+ * Partial close: add closed part proceeds to balance, update open trade with remaining quantity
+ * @param {Object} portfolio - Portfolio state
+ * @param {Object} closedPart - The closed portion (with exitPrice, quantity, pnl, exitFee)
+ * @param {Object} updatedTrade - The remaining open trade (with reduced quantity, tp1Hit)
+ */
+function partialCloseTradeInPortfolio(portfolio, closedPart, updatedTrade) {
+  const exitNotional = closedPart.exitPrice * closedPart.quantity;
+  const exitFee = closedPart.exitFee || 0;
+  const proceeds = closedPart.side === 'SELL'
+    ? -(exitNotional + exitFee)
+    : (exitNotional - exitFee);
+  portfolio.closedTrades.push(closedPart);
+  portfolio.balance = roundTo(portfolio.balance + proceeds, 8);
+
+  if (portfolio.balance > portfolio.peakBalance) {
+    portfolio.peakBalance = portfolio.balance;
+  }
+
+  const idx = portfolio.openTrades.findIndex((t) => t.id === updatedTrade.id);
+  if (idx >= 0) {
+    portfolio.openTrades[idx] = updatedTrade;
+  }
+
+  updateEquityCurve(portfolio);
+}
+
+/**
  * Update equity curve with current state
  * @param {Object} portfolio - Portfolio state
  * @param {number} [timestamp] - Optional timestamp
- * @param {number} [markPrice] - Optional mark price for open positions (default: entry price)
+ * @param {number|Object} [markPrice] - Optional mark price for all positions, or { symbol: price } for per-symbol
  */
 function updateEquityCurve(portfolio, timestamp = Date.now(), markPrice = null) {
+  const markPricesBySymbol = markPrice != null && typeof markPrice === 'object' && !Number.isFinite(markPrice)
+    ? markPrice
+    : null;
+
   const openPositionValue = portfolio.openTrades.reduce((sum, t) => {
-    const price = markPrice !== null ? markPrice : t.entryPrice;
+    let price = t.entryPrice;
+    if (markPricesBySymbol && t.symbol && markPricesBySymbol[t.symbol] != null) {
+      price = markPricesBySymbol[t.symbol];
+    } else if (markPrice != null && Number.isFinite(markPrice)) {
+      price = markPrice;
+    }
     const positionValue = t.side === 'SELL' ? -(price * t.quantity) : (price * t.quantity);
     return sum + positionValue;
   }, 0);
@@ -141,6 +177,7 @@ module.exports = {
   getTradesToday,
   addOpenTrade,
   closeTradeInPortfolio,
+  partialCloseTradeInPortfolio,
   updateEquityCurve,
   getSummary,
 };

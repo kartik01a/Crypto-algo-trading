@@ -135,9 +135,57 @@ function checkExitConditions(trade, candle) {
   return null;
 }
 
+/**
+ * Close a portion of a trade (for swing strategy TP1 partial close)
+ * @param {Object} trade - Open trade object
+ * @param {number} exitPrice - Exit price
+ * @param {number} timestamp - Close timestamp
+ * @param {number} closePercent - Fraction to close (e.g. 0.5 for 50%)
+ * @returns {{ closedPart: Object, updatedTrade: Object }}
+ */
+function closePartialTrade(trade, exitPrice, timestamp, closePercent = 0.5) {
+  const partialQty = roundTo(trade.quantity * closePercent, 8);
+  const remainingQty = roundTo(trade.quantity * (1 - closePercent), 8);
+
+  const adjustedPrice = applySlippage(exitPrice, slippage, trade.side === 'BUY' ? 'sell' : 'buy');
+  const exitFee = calculateFee(adjustedPrice * partialQty, fee);
+
+  let pnl;
+  if (trade.side === 'BUY') {
+    pnl = (adjustedPrice - trade.entryPrice) * partialQty - exitFee;
+  } else {
+    pnl = (trade.entryPrice - adjustedPrice) * partialQty - exitFee;
+  }
+
+  const closedPart = {
+    ...trade,
+    id: `${trade.id}_partial`,
+    quantity: partialQty,
+    exitPrice: roundTo(adjustedPrice, 8),
+    pnl: roundTo(pnl, 8),
+    pnlPercent: roundTo((pnl / (trade.entryPrice * partialQty)) * 100, 4),
+    status: 'CLOSED',
+    exitFee,
+    closedAt: timestamp,
+    partialClose: true,
+  };
+
+  const updatedTrade = {
+    ...trade,
+    quantity: remainingQty,
+    tp1Hit: true,
+    takeProfit1: null,
+    takeProfit2: null,
+    takeProfit: null,
+  };
+
+  return { closedPart, updatedTrade };
+}
+
 module.exports = {
   openTrade,
   closeTrade,
+  closePartialTrade,
   isStopLossHit,
   isTakeProfitHit,
   checkExitConditions,

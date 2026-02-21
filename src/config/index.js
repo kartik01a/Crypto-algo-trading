@@ -31,6 +31,20 @@ module.exports = {
     rsiOverbought: 70,
     atrPeriod: 14,
     atrThresholdPercent: 0.5, // Min ATR as % of price to trade
+    // Swing trend strategy (scoring-based)
+    swingTrend: {
+      atrMultiplier: 1.5,
+      trailAtrMultiplier: 2.5,
+      takeProfitR: 3.5, // Single TP at 3.5R (between 3R and 4R)
+      cooldownCandles: 2,
+      timeExitCandles: 15,
+      buyScoreThreshold: 7,
+      sellScoreThreshold: 7,
+      adxMin: 20,
+      adxStrongThreshold: 25,
+      atrPercentMin: 0.5,
+      earlyExitRThreshold: -0.5,
+    },
   },
 
   // Risk management defaults
