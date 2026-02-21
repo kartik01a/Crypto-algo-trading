@@ -19,7 +19,7 @@ async function saveTrade(trade, mode) {
     exitPrice: trade.exitPrice || null,
     quantity: trade.quantity,
     stopLoss: trade.stopLoss,
-    takeProfit: trade.takeProfit,
+    takeProfit: trade.takeProfit ?? null,
     pnl: trade.pnl || 0,
     fees: (trade.entryFee || 0) + (trade.exitFee || 0),
     status: trade.status || 'OPEN',

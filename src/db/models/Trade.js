@@ -17,7 +17,7 @@ const tradeSchema = new mongoose.Schema(
     exitPrice: { type: Number, default: null },
     quantity: { type: Number, required: true },
     stopLoss: { type: Number, required: true },
-    takeProfit: { type: Number, required: true },
+    takeProfit: { type: Number, default: null }, // null = no fixed TP (trailing stop / let profits run)
     pnl: { type: Number, default: 0 },
     fees: { type: Number, default: 0 },
     status: { type: String, required: true, enum: ['OPEN', 'CLOSED'], default: 'OPEN' },

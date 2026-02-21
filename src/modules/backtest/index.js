@@ -14,6 +14,11 @@ const {
   logTradeMetrics,
   COOLDOWN_CANDLES,
 } = require('../strategy/swingTrendStrategy');
+const {
+  shouldExitTrade: hyperWaveShouldExit,
+  updateTrailingStop: hyperWaveUpdateTrailingStop,
+  logTradeMetrics: hyperWaveLogTradeMetrics,
+} = require('../strategy/hyperWaveMomentumStrategy');
 const { openTrade, closeTrade, checkExitConditions } = require('../execution');
 const {
   createPortfolio,
@@ -85,17 +90,27 @@ async function runBacktest({
   const toTs = parseDate(to);
 
   // Multi-symbol: use symbols array; single-symbol: use symbol
-  const symbols = symbolsParam && symbolsParam.length > 0 ? symbolsParam : [symbol || 'BTC/USDT'];
-  const isMultiSymbol = strategy === 'swingTrend' && symbols.length > 1;
+  const defaultHyperWaveSymbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT'];
+  const symbols = symbolsParam && symbolsParam.length > 0
+    ? symbolsParam
+    : strategy === 'hyperWave'
+      ? defaultHyperWaveSymbols
+      : [symbol || 'BTC/USDT'];
+  const isMultiSymbol = (strategy === 'swingTrend' && symbols.length > 1) ||
+    (strategy === 'hyperWave' && symbols.length > 1);
 
   let candles = ohlcv;
   let htfCandles = null;
   let candlesBySymbol = null;
   let htfCandlesBySymbol = null;
 
-  // For trendPullback we enforce 5m+15m; for swingTrend we enforce 4h+1d
-  const ltfTimeframe = strategy === 'swingTrend' ? '4h' : strategy === 'trendPullback' ? '5m' : timeframe;
-  const htfTimeframe = strategy === 'swingTrend' ? '1d' : '15m';
+  // For trendPullback we enforce 5m+15m; for swingTrend/hyperWave we enforce 4h+1d
+  const ltfTimeframe = strategy === 'swingTrend' || strategy === 'hyperWave'
+    ? '4h'
+    : strategy === 'trendPullback'
+      ? '5m'
+      : timeframe;
+  const htfTimeframe = (strategy === 'swingTrend' || strategy === 'hyperWave') ? '1d' : '15m';
 
   if (isMultiSymbol) {
     // Fetch LTF and HTF for each symbol
@@ -110,15 +125,14 @@ async function runBacktest({
       candlesBySymbol[sym] = await fetchBacktestData(sym, ltfTimeframe, fromTs, toTs);
       htfCandlesBySymbol[sym] = await fetchBacktestData(sym, htfTimeframe, htfFrom, toTs);
     }
-    // Use first symbol's candles for compatibility; main loop will use candlesBySymbol
     candles = candlesBySymbol[symbols[0]];
   } else {
     if (!candles || candles.length === 0) {
       candles = await fetchBacktestData(symbols[0], ltfTimeframe, fromTs, toTs);
     }
-    if (strategy === 'trendPullback' || strategy === 'swingTrend') {
+    if (strategy === 'trendPullback' || strategy === 'swingTrend' || strategy === 'hyperWave') {
       let htfFrom = fromTs;
-      if (strategy === 'swingTrend' && htfTimeframe === '1d') {
+      if (htfTimeframe === '1d') {
         const WARMUP_DAYS_MS = 250 * 24 * 60 * 60 * 1000;
         htfFrom = Math.max(0, fromTs - WARMUP_DAYS_MS);
       }
@@ -134,7 +148,7 @@ async function runBacktest({
   // Backtest runs on historical timestamps; initialize daily reset anchor accordingly
   portfolio.lastDayReset = getStartOfDay(candles[0][0]);
   portfolio.dailyStartBalance = portfolio.balance;
-  const warmupPeriod = strategy === 'swingTrend' ? 220 : 50; // swingTrend needs EMA200
+  const warmupPeriod = strategy === 'swingTrend' || strategy === 'hyperWave' ? 220 : 50; // EMA200
   let lastTradeClosedAt = 0;
   let candlesSinceLastLoss = Infinity; // Cooldown for swingTrend
   let htfIdx = 0;
@@ -221,6 +235,24 @@ async function runBacktest({
       });
     }
 
+    if (strategy === 'hyperWave' && portfolio.openTrades.length > 0 && i >= 1) {
+      portfolio.openTrades = portfolio.openTrades.map((t) => {
+        if (t.strategy !== 'hyperWave') return t;
+        const symCandles = isMultiSymbol && t.symbol ? candlesBySymbol[t.symbol] : candles;
+        const prevCandle = symCandles[i - 1];
+        const prevHigh = prevCandle[2];
+        const prevLow = prevCandle[3];
+        const prevSlice = symCandles.slice(0, i);
+        const prevSignal = getSignal(prevSlice, {
+          strategy: 'hyperWave',
+          openTrades: portfolio.openTrades,
+        });
+        const markPrice = prevSignal.price;
+        const atrNow = prevSignal.atr;
+        return hyperWaveUpdateTrailingStop(t, markPrice, atrNow, prevHigh, prevLow);
+      });
+    }
+
     // 1. Check exit conditions for open trades (SL/TP)
     const tradesToClose = [];
     for (const trade of portfolio.openTrades) {
@@ -248,6 +280,27 @@ async function runBacktest({
         if (exitCheck) {
           tradesToClose.push({ trade, exitPrice: exitCheck.exitPrice, reason: exitCheck.reason });
         }
+      } else if (strategy === 'hyperWave' && trade.strategy === 'hyperWave') {
+        const symCandles = isMultiSymbol && trade.symbol ? candlesBySymbol[trade.symbol] : candles;
+        const sliceForExit = symCandles.slice(0, i + 1);
+        const htfSlice = isMultiSymbol && trade.symbol && htfCandlesBySymbol
+          ? htfCandlesBySymbol[trade.symbol].slice(0, htfIdxBySymbol[trade.symbol] + 1)
+          : htfCandles ? htfCandles.slice(0, htfIdx + 1) : [];
+        const signal = getSignal(sliceForExit, {
+          strategy: 'hyperWave',
+          htfOhlcv: htfSlice,
+          openTrades: portfolio.openTrades,
+        });
+        const exitCheck = hyperWaveShouldExit(trade, tradeCandle, signal.atr, {
+          ema50: signal.ema50,
+          ema200: signal.ema200,
+          rsi: signal.rsi,
+          prevEma50: signal.prevEma50,
+          prevEma200: signal.prevEma200,
+        });
+        if (exitCheck) {
+          tradesToClose.push({ trade, exitPrice: exitCheck.exitPrice, reason: exitCheck.reason });
+        }
       } else {
         const exitCheck = checkExitConditions(trade, tradeCandle);
         if (exitCheck) {
@@ -270,11 +323,24 @@ async function runBacktest({
           : null;
         logger.trade('SwingTrend trade closed', { tradeId: trade.id, reason, pnl: closedTrade.pnl, rMultiple });
       }
+      if (strategy === 'hyperWave' && trade.strategy === 'hyperWave') {
+        const riskDist = trade.initialRiskDistance || Math.abs(trade.entryPrice - trade.stopLoss);
+        const rMultiple = riskDist > 0 && trade.quantity > 0
+          ? roundTo(closedTrade.pnl / (riskDist * trade.quantity), 4)
+          : null;
+        logger.trade('HyperWave trade closed', {
+          tradeId: trade.id,
+          reason,
+          pnl: closedTrade.pnl,
+          rMultiple,
+          entryReason: trade.entryReason,
+        });
+      }
       await tradePersistence.persistTradeClose(closedTrade, reason, 'backtest');
     }
 
     // 2. Generate signal (single-symbol) or collect & rank signals (multi-symbol)
-    if (strategy === 'trendPullback' || strategy === 'swingTrend') {
+    if (strategy === 'trendPullback' || strategy === 'swingTrend' || strategy === 'hyperWave') {
       if (isMultiSymbol) {
         for (const sym of symbols) {
           while (htfCandlesBySymbol[sym] && htfIdxBySymbol[sym] < htfCandlesBySymbol[sym].length - 1
@@ -309,19 +375,38 @@ async function runBacktest({
           allSignals.push({ ...s, symbol: sym });
         }
       }
-      // Rank by score descending, exclude symbols we already have
       allSignals.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
       const available = allSignals.filter((s) => !openSymbols.has(s.symbol));
       const topSignals = available.slice(0, 2 - portfolio.openTrades.length);
       signal = { topSignals, primary: topSignals[0] || { signal: 'HOLD', price: close, timestamp } };
+    } else if (isMultiSymbol && strategy === 'hyperWave') {
+      // Collect signals from all symbols, take up to 3 (1 per symbol)
+      const allSignals = [];
+      for (const sym of symbols) {
+        const symCandles = candlesBySymbol[sym];
+        const symHtf = htfCandlesBySymbol[sym];
+        const symSlice = symCandles.slice(0, i + 1);
+        const htfSlice = symHtf ? symHtf.slice(0, htfIdxBySymbol[sym] + 1) : [];
+        const s = getSignal(symSlice, {
+          strategy: 'hyperWave',
+          htfOhlcv: htfSlice,
+          openTrades: portfolio.openTrades,
+        });
+        if (['BUY', 'SELL'].includes(s.signal)) {
+          allSignals.push({ ...s, symbol: sym });
+        }
+      }
+      const available = allSignals.filter((s) => !openSymbols.has(s.symbol));
+      const topSignals = available.slice(0, 3 - portfolio.openTrades.length);
+      signal = { topSignals, primary: topSignals[0] || { signal: 'HOLD', price: close, timestamp } };
     } else {
-      const htfSlice = !isMultiSymbol && (strategy === 'trendPullback' || strategy === 'swingTrend')
+      const htfSlice = !isMultiSymbol && (strategy === 'trendPullback' || strategy === 'swingTrend' || strategy === 'hyperWave')
         ? (htfCandles ? htfCandles.slice(0, htfIdx + 1) : [])
         : [];
       signal = getSignal(ohlcvSlice, {
-        strategy: strategy === 'trendPullback' ? 'trendPullback' : strategy === 'swingTrend' ? 'swingTrend' : undefined,
+        strategy: strategy === 'trendPullback' ? 'trendPullback' : strategy === 'swingTrend' ? 'swingTrend' : strategy === 'hyperWave' ? 'hyperWave' : undefined,
         htfOhlcv: htfSlice,
-        openTrades: strategy === 'swingTrend' ? portfolio.openTrades : undefined,
+        openTrades: (strategy === 'swingTrend' || strategy === 'hyperWave') ? portfolio.openTrades : undefined,
       });
     }
 
@@ -390,8 +475,13 @@ async function runBacktest({
 
     // 3. Apply risk rules and execute new trade(s) (BUY or SELL)
     const cooldownOk = strategy !== 'swingTrend' || candlesSinceLastLoss >= COOLDOWN_CANDLES;
-    const maxOpenOk = strategy !== 'swingTrend' || portfolio.openTrades.length < 2;
-    const maxNewTrades = strategy === 'swingTrend' ? 2 - portfolio.openTrades.length : 1;
+    const maxOpenTradesForStrategy = strategy === 'hyperWave'
+      ? (isMultiSymbol ? 3 : 1)
+      : strategy === 'swingTrend'
+        ? 2
+        : 1;
+    const maxOpenOk = portfolio.openTrades.length < maxOpenTradesForStrategy;
+    const maxNewTrades = maxOpenTradesForStrategy - portfolio.openTrades.length;
     const signalsToOpen = isMultiSymbol && signal.topSignals
       ? signal.topSignals.slice(0, maxNewTrades)
       : (['BUY', 'SELL'].includes(signal.signal) ? [signal] : []);
@@ -420,25 +510,27 @@ async function runBacktest({
           ? { maxTradesPerDay: 2, tradeCooldownMs: 30 * 60 * 1000, now: timestamp }
           : strategy === 'swingTrend'
             ? { maxTradesPerDay: 2, tradeCooldownMs: 0, now: timestamp }
-            : null;
+            : strategy === 'hyperWave'
+              ? { maxTradesPerDay: 3, tradeCooldownMs: 0, now: timestamp }
+              : null;
         const { allowed } = canOpenTrade(riskStateWithCooldown, riskOverrides);
         if (allowed) {
           const useCustomRisk =
             (strategy === 'trendPullback' && sig.stopLoss && sig.takeProfit) ||
-            (strategy === 'swingTrend' && sig.stopLoss);
+            (strategy === 'swingTrend' && sig.stopLoss) ||
+            (strategy === 'hyperWave' && sig.stopLoss);
           const riskParams = useCustomRisk
             ? getTradeRiskParamsCustom(
                 sig.price,
                 side,
                 sig.stopLoss,
                 sig.takeProfit || Infinity,
-                portfolio.balance,
-                strategy === 'swingTrend' ? (sig.suggestedRiskPercent ?? 0.01) : null
+                portfolio.balance
               )
             : getTradeRiskParams(sig.price, side, portfolio.balance);
 
           const { stopLoss, takeProfit, positionSize } = riskParams;
-          const effectiveTakeProfit = strategy === 'swingTrend' ? null : takeProfit;
+          const effectiveTakeProfit = (strategy === 'swingTrend' || strategy === 'hyperWave') ? null : takeProfit;
 
           if (positionSize > 0) {
             const trade = openTrade({
@@ -449,12 +541,13 @@ async function runBacktest({
               takeProfit: effectiveTakeProfit,
               timestamp,
               symbol: tradeSymbol,
-              strategy: strategy === 'trendPullback' ? 'trendPullback' : strategy === 'swingTrend' ? 'swingTrend' : 'default',
+              strategy: strategy === 'trendPullback' ? 'trendPullback' : strategy === 'swingTrend' ? 'swingTrend' : strategy === 'hyperWave' ? 'hyperWave' : 'default',
               atrAtEntry: sig.atr,
               initialStopLoss: stopLoss,
               initialRiskDistance: Math.abs(sig.price - stopLoss),
               takeProfit: strategy === 'swingTrend' ? sig.takeProfit : undefined,
               score: strategy === 'swingTrend' ? sig.score : undefined,
+              entryReason: strategy === 'hyperWave' ? sig.entryReason : undefined,
             });
 
             addOpenTrade(portfolio, trade);
@@ -487,9 +580,9 @@ async function runBacktest({
     const exitPrice = isMultiSymbol && trade.symbol && candlesBySymbol[trade.symbol]
       ? candlesBySymbol[trade.symbol][lastIdx][4]
       : lastCandle[4];
-    const closedTrade = closeTrade(trade, exitPrice, lastTimestamp);
+    const closedTrade = { ...closeTrade(trade, exitPrice, lastTimestamp), exitReason: 'END_OF_BACKTEST' };
     closeTradeInPortfolio(portfolio, closedTrade);
-    await tradePersistence.persistTradeClose(closedTrade, 'MANUAL', 'backtest');
+    await tradePersistence.persistTradeClose(closedTrade, 'END_OF_BACKTEST', 'backtest');
   }
 
   const lastMarkPrice = isMultiSymbol
@@ -515,6 +608,9 @@ async function runBacktest({
 
   if (strategy === 'swingTrend' && closedTrades.length > 0) {
     logTradeMetrics(closedTrades);
+  }
+  if (strategy === 'hyperWave' && closedTrades.length > 0) {
+    hyperWaveLogTradeMetrics(closedTrades);
   }
 
   // Build drawdown curve from equity curve

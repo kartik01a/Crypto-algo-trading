@@ -10,6 +10,7 @@ const { EMA, RSI, ATR } = require('technicalindicators');
 const config = require('../../config');
 const { trendPullbackStrategy } = require('./trendPullbackStrategy');
 const { swingTrendStrategy } = require('./swingTrendStrategy');
+const { hyperWaveStrategy } = require('./hyperWaveMomentumStrategy');
 
 const {
   emaShort,
@@ -186,6 +187,13 @@ module.exports = {
           openTrades: options.openTrades || [],
         });
       }
+      if (options.strategy === 'hyperWave') {
+        return hyperWaveStrategy({
+          ltfOhlcv: ohlcvHistory,
+          htfOhlcv: options.htfOhlcv || [],
+          openTrades: options.openTrades || [],
+        });
+      }
       return generateSignal(ohlcvHistory);
     } catch (err) {
       return {
@@ -204,4 +212,5 @@ module.exports = {
   applyTrendFilter,
   trendPullbackStrategy,
   swingTrendStrategy,
+  hyperWaveStrategy,
 };

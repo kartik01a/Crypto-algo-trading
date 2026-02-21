@@ -45,6 +45,15 @@ module.exports = {
       atrPercentMin: 0.5,
       earlyExitRThreshold: -0.5,
     },
+    hyperWave: {
+      rsiHigh: 65,
+      rsiLow: 35,
+      mfiLongMin: 45,
+      mfiShortMax: 55,
+      adxMin: 18,
+      atrSlMultiplier: 2,
+      atrTrailMultiplier: 3,
+    },
   },
 
   // Risk management defaults

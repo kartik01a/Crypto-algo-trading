@@ -16,7 +16,7 @@ async function executeBacktest(body) {
     timeframe = '5m',
     from,
     to,
-    initialBalance = 10000,
+    initialBalance = 20000,
     strategy = null,
     debug = true,
   } = body;
