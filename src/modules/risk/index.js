@@ -16,6 +16,8 @@ const { roundTo, getStartOfDay } = require('../../utils/helpers');
 
 const {
   riskPerTrade,
+  maxTotalRiskPercent = 0.03,
+  maxOpenTrades: configMaxOpenTrades = 3,
   maxTradesPerDay,
   maxDailyLoss,
   maxDrawdown,
@@ -37,6 +39,7 @@ const {
  * @param {number} [overrides.maxTradesPerDay] - Optional override for max trades/day
  * @param {number} [overrides.tradeCooldownMs] - Optional override for cooldown (ms)
  * @param {number} [overrides.now] - Optional timestamp override (ms) for cooldown timing
+ * @param {number} [overrides.maxDrawdown] - Optional override for max drawdown (0-1)
  * @returns {Object} { allowed: boolean, reason?: string }
  */
 function canOpenTrade(state, overrides = null) {
@@ -47,10 +50,13 @@ function canOpenTrade(state, overrides = null) {
   const cooldownMs = overrides && typeof overrides.tradeCooldownMs === 'number'
     ? overrides.tradeCooldownMs
     : tradeCooldownMs;
+  const drawdownLimit = overrides && typeof overrides.maxDrawdown === 'number'
+    ? overrides.maxDrawdown
+    : maxDrawdown;
   const now = overrides && typeof overrides.now === 'number' ? overrides.now : Date.now();
 
-  // Trade cooldown: 10 minutes between trades
-  if (lastTradeClosedAt && cooldownMs) {
+  // Trade cooldown: 10 minutes between trades (skip if cooldownMs is 0)
+  if (lastTradeClosedAt && cooldownMs > 0) {
     const elapsed = now - lastTradeClosedAt;
     if (elapsed < cooldownMs) {
       return { allowed: false, reason: 'Trade cooldown active' };
@@ -64,7 +70,7 @@ function canOpenTrade(state, overrides = null) {
 
   // Max drawdown check
   const currentDrawdown = peakBalance > 0 ? (peakBalance - balance) / peakBalance : 0;
-  if (currentDrawdown >= maxDrawdown) {
+  if (currentDrawdown >= drawdownLimit) {
     return { allowed: false, reason: 'Max drawdown exceeded' };
   }
 
@@ -142,14 +148,33 @@ function calculatePositionSize(balance, entryPrice, side) {
  * @param {number} balance - Current balance
  * @param {number} entryPrice - Entry price
  * @param {number} stopLoss - Stop loss price
+ * @param {number} [riskPercent] - Risk per trade (default: riskPerTrade)
  * @returns {number} Position size in base currency
  */
-function calculatePositionSizeWithStop(balance, entryPrice, stopLoss) {
-  const riskAmount = balance * riskPerTrade;
+function calculatePositionSizeWithStop(balance, entryPrice, stopLoss, riskPercent = riskPerTrade) {
+  const riskAmount = balance * riskPercent;
   const stopLossDistance = Math.abs(entryPrice - stopLoss);
   if (!stopLossDistance || stopLossDistance <= 0) return 0;
   const positionSize = riskAmount / stopLossDistance;
   return roundTo(Math.max(0, positionSize), 8);
+}
+
+/**
+ * Get total risk (as fraction of balance) across open trades
+ * @param {Array} openTrades - Open trades with initialRiskDistance, quantity, entryPrice
+ * @param {number} balance - Current balance
+ * @returns {number} Total risk as fraction (e.g. 0.02 = 2%)
+ */
+function getTotalOpenRiskPercent(openTrades, balance) {
+  if (!openTrades || balance <= 0) return 0;
+  let totalRisk = 0;
+  for (const t of openTrades) {
+    const riskDist = t.initialRiskDistance || Math.abs(t.entryPrice - t.stopLoss);
+    if (riskDist > 0 && t.quantity > 0) {
+      totalRisk += (riskDist * t.quantity) / balance;
+    }
+  }
+  return totalRisk;
 }
 
 /**
@@ -174,12 +199,13 @@ function getTradeRiskParams(entryPrice, side, balance) {
  * @param {number} stopLoss
  * @param {number} takeProfit
  * @param {number} balance
+ * @param {number} [suggestedRiskPercent] - Risk per trade (default: riskPerTrade)
  */
-function getTradeRiskParamsCustom(entryPrice, side, stopLoss, takeProfit, balance) {
+function getTradeRiskParamsCustom(entryPrice, side, stopLoss, takeProfit, balance, suggestedRiskPercent = riskPerTrade) {
   return {
     stopLoss,
     takeProfit,
-    positionSize: calculatePositionSizeWithStop(balance, entryPrice, stopLoss),
+    positionSize: calculatePositionSizeWithStop(balance, entryPrice, stopLoss, suggestedRiskPercent),
     side,
   };
 }
@@ -192,4 +218,7 @@ module.exports = {
   calculatePositionSizeWithStop,
   getTradeRiskParams,
   getTradeRiskParamsCustom,
+  getTotalOpenRiskPercent,
+  maxTotalRiskPercent,
+  configMaxOpenTrades,
 };

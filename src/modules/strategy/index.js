@@ -10,6 +10,7 @@ const { EMA, RSI, ATR } = require('technicalindicators');
 const config = require('../../config');
 const { trendPullbackStrategy } = require('./trendPullbackStrategy');
 const { swingTrendStrategy } = require('./swingTrendStrategy');
+const { goldenCrossHTFStrategy } = require('./goldenCrossHTFStrategy');
 
 const {
   emaShort,
@@ -184,6 +185,14 @@ module.exports = {
           ltfOhlcv: ohlcvHistory,
           htfOhlcv: options.htfOhlcv || [],
           openTrades: options.openTrades || [],
+        });
+      }
+      if (options.strategy === 'goldenCrossHTF') {
+        return goldenCrossHTFStrategy({
+          ltfOhlcv: ohlcvHistory,
+          htfOhlcv: options.htfOhlcv || [],
+          openTrades: options.openTrades || [],
+          symbol: options.symbol || null,
         });
       }
       return generateSignal(ohlcvHistory);

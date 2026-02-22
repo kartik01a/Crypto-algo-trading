@@ -11,7 +11,7 @@ const { runBacktest } = require('../modules/backtest');
  */
 async function executeBacktest(body) {
   const {
-    symbol = 'BTC/USDT',
+    symbol = null,
     symbols: symbolsParam = null,
     timeframe = '5m',
     from,
@@ -19,21 +19,30 @@ async function executeBacktest(body) {
     initialBalance = 10000,
     strategy = null,
     debug = true,
+    maxOpenTrades = null,
   } = body;
 
   if (!from || !to) {
     throw new Error('Missing required parameters: from and to dates (YYYY-MM-DD)');
   }
 
+  // Support symbols[] or single symbol (convert to array)
+  const symbols = symbolsParam && symbolsParam.length > 0
+    ? symbolsParam
+    : symbol
+      ? [symbol]
+      : ['BTC/USDT'];
+
   return runBacktest({
-    symbol,
-    symbols: symbolsParam,
+    symbol: symbols[0],
+    symbols,
     timeframe,
     from,
     to,
     initialBalance,
     strategy,
     debug,
+    maxOpenTrades,
   });
 }
 

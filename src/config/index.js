@@ -45,12 +45,23 @@ module.exports = {
       atrPercentMin: 0.5,
       earlyExitRThreshold: -0.5,
     },
+    goldenCrossHTF: {
+      emaFast: 20,
+      emaSlow: 50,
+      htfEma: 50,
+      adxThreshold: 15,
+      trailPercent: 0.02,
+      minHoldBars: 3,
+      maxHoldBars: 30,
+    },
   },
 
   // Risk management defaults
   risk: {
     initialBalance: 10000,
-    riskPerTrade: 0.01, // 1%
+    riskPerTrade: 0.01, // 1% per trade
+    maxTotalRiskPercent: 0.03, // 3% total across all open trades
+    maxOpenTrades: 3,
     maxTradesPerDay: 3,
     maxDailyLoss: 0.05, // 5%
     maxDrawdown: 0.10, // 10%
