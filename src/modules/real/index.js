@@ -12,6 +12,7 @@ const tradePersistence = require('../../services/tradePersistence');
 const {
   getAvailableBalance,
   placeOrder,
+  placeStopLossOrder,
   getOrderStatus,
   cancelOrder,
   fetchCandles,
@@ -22,44 +23,58 @@ const {
 const { getSignal } = require('../strategy');
 const { applyTrendPullbackTrailingStop } = require('../strategy/trendPullbackStrategy');
 const {
+  shouldExitTrade: shouldExitTradeGoldenCross,
+  updateTrailingStop: updateTrailingStopGoldenCross,
+} = require('../strategy/goldenCrossHTFStrategy');
+const {
   calculateStopLoss,
   calculateTakeProfit,
   calculatePositionSize,
   getTradeRiskParams,
   calculatePositionSizeWithStop,
   getTradeRiskParamsCustom,
+  configMaxOpenTrades,
 } = require('../risk');
 
 const DRY_RUN = process.env.DRY_RUN === 'true';
 const KILL_SWITCH_THRESHOLD = parseFloat(process.env.KILL_SWITCH_LOSS_PERCENT || '10');
 const INTERVAL_MS = 60000; // 1 minute
+const GOLDEN_CROSS_MIN_LTF = 55;
 
 // Real trading risk limits (stricter than paper)
 const MAX_CAPITAL_PER_TRADE = 0.05; // 5%
 const RISK_PER_TRADE = 0.01; // 1%
 const MAX_DAILY_LOSS = 0.05; // 5%
 const MAX_DRAWDOWN = 0.10; // 10%
-const MAX_OPEN_TRADES = 1;
 
 let realState = {
   isRunning: false,
   intervalId: null,
-  currentTrade: null,
+  currentTrade: null, // Single-symbol backward compat
+  openTrades: [], // Multi-symbol: array of open trades
   balance: 0,
   peakBalance: 0,
   dailyStartBalance: 0,
   dailyLoss: 0,
   lastDayReset: 0,
   symbol: 'BTC/USDT',
-  timeframe: '5m', // LTF for signals
+  symbols: ['BTC/USDT'],
+  maxOpenTrades: 1,
+  timeframe: '5m',
   htfTimeframe: '15m',
   strategy: null,
   quoteCurrency: 'USDT',
   ohlcvHistory: [],
   htfOhlcvHistory: [],
+  ohlcvHistoryBySymbol: {},
+  htfOhlcvHistoryBySymbol: {},
   minHistoryLength: 50,
   killSwitchTriggered: false,
   lastTradeClosedAt: 0,
+  longOnly: false,
+  lastProcessedCandleTs: 0,
+  lastProcessedCandleTsBySymbol: {},
+  useExchangeStopLoss: true, // Place stop_limit on CoinDCX; when false, app-managed SL
 };
 
 /**
@@ -79,31 +94,35 @@ function candleToOHLCV(candle) {
 }
 
 /**
- * Fetch OHLCV history from CoinDCX
+ * Fetch OHLCV history from CoinDCX for a symbol
  */
-async function fetchRealOHLCVHistory(timeframe, limit = 100) {
-  const pair = symbolToPair(realState.symbol);
+async function fetchRealOHLCVHistory(symbol, timeframe, limit = 100) {
+  const pair = symbolToPair(symbol);
   const candles = await fetchCandles(pair, timeframe, limit);
   return candles.map(candleToOHLCV).sort((a, b) => a[0] - b[0]);
 }
 
 /**
  * Check if we can open a new trade (strict risk rules)
+ * @param {string} [symbol] - Optional: skip if already have trade in this symbol
  */
-function canOpenRealTrade() {
+function canOpenRealTrade(symbol = null) {
   if (realState.killSwitchTriggered) {
     return { allowed: false, reason: 'Kill switch triggered' };
   }
 
-  if (realState.currentTrade) {
-    return { allowed: false, reason: 'Already have open trade (max 1)' };
+  const trades = realState.openTrades.length > 0 ? realState.openTrades : (realState.currentTrade ? [realState.currentTrade] : []);
+  if (trades.length >= realState.maxOpenTrades) {
+    return { allowed: false, reason: 'Max open trades reached' };
+  }
+  if (symbol && trades.some((t) => t.symbol === symbol)) {
+    return { allowed: false, reason: 'Already have open trade in symbol' };
   }
 
   if (realState.balance <= 0) {
     return { allowed: false, reason: 'Insufficient balance' };
   }
 
-  // Max drawdown
   const drawdown = realState.peakBalance > 0
     ? (realState.peakBalance - realState.balance) / realState.peakBalance
     : 0;
@@ -111,7 +130,6 @@ function canOpenRealTrade() {
     return { allowed: false, reason: 'Max drawdown exceeded' };
   }
 
-  // Max daily loss
   const dailyLossPercent = realState.dailyStartBalance > 0
     ? (realState.dailyStartBalance - realState.balance) / realState.dailyStartBalance
     : 0;
@@ -143,11 +161,13 @@ function getRealPositionSizeWithStop(balance, entryPrice, stopLoss) {
 
 /**
  * Execute buy order (real or simulated)
+ * @param {string} symbol - Trading pair (e.g. 'BTC/USDT')
  */
-async function executeBuy(price, quantity, stopLoss, takeProfit) {
+async function executeBuy(symbol, price, quantity, stopLoss, takeProfit) {
   const trade = {
     id: null,
     orderId: null,
+    symbol,
     entryPrice: price,
     quantity,
     side: 'BUY',
@@ -159,6 +179,7 @@ async function executeBuy(price, quantity, stopLoss, takeProfit) {
 
   if (DRY_RUN) {
     logger.info('DRY_RUN: Simulated BUY order', {
+      symbol,
       price,
       quantity,
       stopLoss,
@@ -172,7 +193,7 @@ async function executeBuy(price, quantity, stopLoss, takeProfit) {
 
   try {
     const order = await placeOrder({
-      symbol: realState.symbol,
+      symbol,
       side: 'buy',
       quantity,
       price,
@@ -187,6 +208,26 @@ async function executeBuy(price, quantity, stopLoss, takeProfit) {
     }
 
     trade.status = 'OPEN';
+
+    // Place exchange-side stop loss (CoinDCX stop_limit)
+    if (stopLoss != null && realState.useExchangeStopLoss) {
+      try {
+        const stopOrder = await placeStopLossOrder({
+          symbol,
+          side: 'sell',
+          quantity,
+          stopPrice: stopLoss,
+          limitPrice: stopLoss * 0.999, // Slightly below for fill certainty on fast drops
+        });
+        trade.stopOrderId = stopOrder.id || stopOrder.order_id;
+        logger.info('Stop loss order placed', { stopOrderId: trade.stopOrderId, stopPrice: stopLoss });
+      } catch (err) {
+        logger.error('Failed to place stop loss order', { error: err.message, stopLoss });
+        // Trade is open; fall back to app-managed SL
+        trade.stopOrderId = null;
+      }
+    }
+
     logger.info('Trade executed: BUY', {
       orderId: trade.orderId,
       price,
@@ -203,12 +244,14 @@ async function executeBuy(price, quantity, stopLoss, takeProfit) {
 }
 
 /**
- * Execute sell/close order
+ * Execute sell/close order (close long position)
  * Uses market_order for immediate fill when SL/TP hit
  */
 async function executeSell(trade, price, reason) {
+  const sym = trade.symbol || realState.symbol;
   if (DRY_RUN) {
-    logger.info('DRY_RUN: Simulated SELL (close)', {
+    logger.info('DRY_RUN: Simulated SELL (close long)', {
+      symbol: sym,
       reason,
       price,
       quantity: trade.quantity,
@@ -217,16 +260,15 @@ async function executeSell(trade, price, reason) {
   }
 
   try {
-    // Use market order for immediate execution when closing
     await placeOrder({
-      symbol: realState.symbol,
+      symbol: sym,
       side: 'sell',
       quantity: trade.quantity,
-      price, // Not used for market_order but kept for API compatibility
+      price,
       orderType: 'market_order',
     });
 
-    logger.info('Trade closed: SELL', {
+    logger.info('Trade closed: SELL (long)', {
       reason,
       orderId: trade.orderId,
       price,
@@ -241,6 +283,116 @@ async function executeSell(trade, price, reason) {
 }
 
 /**
+ * Execute buy/cover order (close short position)
+ */
+async function executeCover(trade, price, reason) {
+  const sym = trade.symbol || realState.symbol;
+  if (DRY_RUN) {
+    logger.info('DRY_RUN: Simulated BUY (close short)', {
+      symbol: sym,
+      reason,
+      price,
+      quantity: trade.quantity,
+    });
+    return { success: true };
+  }
+
+  try {
+    await placeOrder({
+      symbol: sym,
+      side: 'buy',
+      quantity: trade.quantity,
+      price,
+      orderType: 'market_order',
+    });
+
+    logger.info('Trade closed: BUY (short cover)', {
+      reason,
+      orderId: trade.orderId,
+      price,
+      quantity: trade.quantity,
+    });
+
+    return { success: true };
+  } catch (err) {
+    logger.error('Cover order failed', { error: err.message, tradeId: trade.id });
+    throw err;
+  }
+}
+
+/**
+ * Execute short order (open short position)
+ * Note: Requires margin/futures on CoinDCX; spot-only will fail
+ * @param {string} symbol - Trading pair
+ */
+async function executeShort(symbol, price, quantity, stopLoss) {
+  // Short: stop loss is buy/cover when price rises
+  if (DRY_RUN) {
+    logger.info('DRY_RUN: Simulated SHORT (open)', {
+      symbol,
+      price,
+      quantity,
+      stopLoss,
+    });
+    return {
+      id: `dry_${Date.now()}`,
+      orderId: 'simulated',
+      status: 'OPEN',
+      symbol,
+      entryPrice: price,
+      quantity,
+      side: 'SELL',
+      stopLoss,
+      openedAt: Date.now(),
+    };
+  }
+
+  try {
+    const order = await placeOrder({
+      symbol,
+      side: 'sell',
+      quantity,
+      price,
+      orderType: 'limit_order',
+    });
+
+    const trade = {
+      id: order.id || order.order_id,
+      orderId: order.id || order.order_id,
+      status: 'OPEN',
+      symbol,
+      entryPrice: price,
+      quantity,
+      side: 'SELL',
+      stopLoss,
+      openedAt: Date.now(),
+    };
+
+    if (stopLoss != null && realState.useExchangeStopLoss) {
+      try {
+        const stopOrder = await placeStopLossOrder({
+          symbol,
+          side: 'buy',
+          quantity,
+          stopPrice: stopLoss,
+          limitPrice: stopLoss * 1.001,
+        });
+        trade.stopOrderId = stopOrder.id || stopOrder.order_id;
+        logger.info('Stop loss order placed (short)', { stopOrderId: trade.stopOrderId, stopPrice: stopLoss });
+      } catch (err) {
+        logger.error('Failed to place stop loss order (short)', { error: err.message, stopLoss });
+        trade.stopOrderId = null;
+      }
+    }
+
+    return trade;
+  } catch (err) {
+    logger.error('Short order failed', { error: err.message, price, quantity });
+    throw err;
+  }
+}
+
+/**
  * Check if SL or TP is hit (using current price)
  */
 function checkSLTP(trade, currentPrice) {
@@ -248,8 +400,35 @@ function checkSLTP(trade, currentPrice) {
     if (currentPrice <= trade.stopLoss) {
       return { hit: true, reason: 'STOP_LOSS', exitPrice: trade.stopLoss };
     }
-    if (currentPrice >= trade.takeProfit) {
+    if (trade.takeProfit && currentPrice >= trade.takeProfit) {
       return { hit: true, reason: 'TAKE_PROFIT', exitPrice: trade.takeProfit };
+    }
+  }
+  if (trade.side === 'SELL') {
+    if (currentPrice >= trade.stopLoss) {
+      return { hit: true, reason: 'STOP_LOSS', exitPrice: trade.stopLoss };
+    }
+  }
+  return { hit: false };
+}
+
+/**
+ * Check goldenCrossHTF exit: trailing stop (price hit) or max hold (time-based)
+ */
+function checkGoldenCrossExit(trade, currentPrice) {
+  const cfg = require('../strategy/goldenCrossHTFStrategy').getConfig();
+  const barsInTrade = trade.candleCount ?? 0;
+
+  if (barsInTrade >= cfg.maxHoldBars) {
+    return { hit: true, reason: 'MAX_HOLD', exitPrice: currentPrice };
+  }
+  const side = trade.side || 'BUY';
+  if (barsInTrade >= cfg.minHoldBars) {
+    if (side === 'BUY' && currentPrice <= trade.stopLoss) {
+      return { hit: true, reason: 'TRAILING_STOP', exitPrice: trade.stopLoss };
+    }
+    if (side === 'SELL' && currentPrice >= trade.stopLoss) {
+      return { hit: true, reason: 'TRAILING_STOP', exitPrice: trade.stopLoss };
     }
   }
   return { hit: false };
@@ -262,6 +441,8 @@ async function runRealTick() {
   if (!realState.isRunning) return;
 
   try {
+    const openCount = realState.symbols.length > 1 ? realState.openTrades.length : (realState.currentTrade ? 1 : 0);
+    logger.info('Real tick', { openTrades: openCount, balance: roundTo(realState.balance, 2) });
     // Reset daily tracking if new day
     const now = Date.now();
     const dayStart = getStartOfDay(now);
@@ -292,123 +473,335 @@ async function runRealTick() {
       return;
     }
 
-    // If we have an open trade, check SL/TP
-    if (realState.currentTrade) {
-      const pair = symbolToPair(realState.symbol);
-      const tickerData = await fetchTicker(symbolToMarket(realState.symbol));
-      const currentPrice = parseFloat(tickerData?.last_price || tickerData?.bid || 0);
+    // Get open trades: multi-symbol uses openTrades, single uses currentTrade
+    const openTrades = realState.symbols.length > 1
+      ? realState.openTrades
+      : (realState.currentTrade ? [realState.currentTrade] : []);
 
-      if (currentPrice > 0) {
-        // Trailing stop update (trendPullback only)
-        if (realState.currentTrade.strategy === 'trendPullback') {
-          const ltfCandles = await fetchRealOHLCVHistory(realState.timeframe, 120);
-          const mtfSignal = getSignal(ltfCandles, {
-            strategy: 'trendPullback',
-            htfOhlcv: realState.htfOhlcvHistory,
-          });
-          const atr = mtfSignal.atr;
-          realState.currentTrade = applyTrendPullbackTrailingStop(realState.currentTrade, currentPrice, atr);
+    // If we have open trades, check SL/TP for each
+    if (openTrades.length > 0) {
+      for (let i = 0; i < openTrades.length; i++) {
+        let trade = openTrades[i];
+        const sym = trade.symbol || realState.symbol;
+        const tickerData = await fetchTicker(symbolToMarket(sym));
+        const currentPrice = parseFloat(tickerData?.last_price || tickerData?.bid || 0);
+        if (currentPrice <= 0) continue;
+
+        // 1. Check if exchange stop order filled (when using exchange-side SL)
+        if (!DRY_RUN && trade.stopOrderId && realState.useExchangeStopLoss) {
+          try {
+            const stopStatus = await getOrderStatus(trade.stopOrderId);
+            const status = (stopStatus.status || stopStatus.order_status || '').toLowerCase();
+            if (status === 'filled' || status === 'partially_cancelled') {
+              const exitPrice = parseFloat(stopStatus.average_price || stopStatus.price_per_unit || trade.stopLoss) || trade.stopLoss;
+              logger.info('Exchange stop order filled', { tradeId: trade.id, symbol: sym, exitPrice, status });
+
+              const isShort = trade.side === 'SELL';
+              const pnl = isShort
+                ? (trade.entryPrice - exitPrice) * trade.quantity
+                : (exitPrice - trade.entryPrice) * trade.quantity;
+
+              const closedTrade = {
+                ...trade,
+                symbol: sym,
+                exitPrice,
+                pnl,
+                status: 'CLOSED',
+                closedAt: Date.now(),
+              };
+              await tradePersistence.persistTradeClose(closedTrade, 'STOP_LOSS', 'real');
+              realState.lastTradeClosedAt = Date.now();
+
+              if (realState.symbols.length > 1) {
+                realState.openTrades = realState.openTrades.filter((t) => t.id !== trade.id);
+              } else {
+                realState.currentTrade = null;
+              }
+              continue;
+            }
+          } catch (err) {
+            logger.warn('Failed to check stop order status', { stopOrderId: trade.stopOrderId, error: err.message });
+          }
         }
 
-        const sltpCheck = checkSLTP(realState.currentTrade, currentPrice);
-        if (sltpCheck.hit) {
-          logger.info(`${sltpCheck.reason} hit`, {
-            tradeId: realState.currentTrade.id,
-            exitPrice: sltpCheck.exitPrice,
+        // 2. Trailing stop update (and update exchange stop when changed)
+        if (trade.strategy === 'trendPullback') {
+          const ltfCandles = await fetchRealOHLCVHistory(sym, realState.timeframe, 120);
+          const htfHist = realState.htfOhlcvHistoryBySymbol?.[sym] || realState.htfOhlcvHistory;
+          const mtfSignal = getSignal(ltfCandles, {
+            strategy: 'trendPullback',
+            htfOhlcv: htfHist,
+          });
+          const atr = mtfSignal.atr;
+          trade = applyTrendPullbackTrailingStop(trade, currentPrice, atr);
+        } else if (trade.strategy === 'goldenCrossHTF') {
+          const candles = await fetchRealOHLCVHistory(sym, realState.timeframe, 10);
+          if (candles.length >= 2) {
+            const latestTs = candles[candles.length - 1][0];
+            const lastTs = realState.lastProcessedCandleTsBySymbol?.[sym] ?? realState.lastProcessedCandleTs;
+            if (latestTs > lastTs) {
+              if (!realState.lastProcessedCandleTsBySymbol) realState.lastProcessedCandleTsBySymbol = {};
+              realState.lastProcessedCandleTsBySymbol[sym] = latestTs;
+              const prevCandle = candles[candles.length - 2];
+              const [, , prevHigh, prevLow] = prevCandle;
+              const updated = updateTrailingStopGoldenCross(trade, prevCandle, prevHigh, prevLow);
+              updated.candleCount = (trade.candleCount || 0) + 1;
+              const oldStop = trade.stopLoss;
+              trade = updated;
+              // Update exchange stop when trailing stop changes
+              if (!DRY_RUN && trade.stopOrderId && realState.useExchangeStopLoss && trade.stopLoss !== oldStop) {
+                try {
+                  await cancelOrder(trade.stopOrderId);
+                  const stopOrder = await placeStopLossOrder({
+                    symbol: sym,
+                    side: trade.side === 'BUY' ? 'sell' : 'buy',
+                    quantity: trade.quantity,
+                    stopPrice: trade.stopLoss,
+                    limitPrice: trade.side === 'BUY' ? trade.stopLoss * 0.999 : trade.stopLoss * 1.001,
+                  });
+                  trade.stopOrderId = stopOrder.id || stopOrder.order_id;
+                  logger.info('Trailing stop updated on exchange', { stopOrderId: trade.stopOrderId, newStop: trade.stopLoss });
+                } catch (err) {
+                  logger.error('Failed to update exchange stop', { error: err.message, newStop: trade.stopLoss });
+                }
+              }
+            }
+          }
+        }
+
+        // 3. Exit check (manual close for MAX_HOLD, TP, or when no exchange stop)
+        let exitCheck = null;
+        if (trade.strategy === 'goldenCrossHTF') {
+          exitCheck = checkGoldenCrossExit(trade, currentPrice);
+        } else {
+          exitCheck = checkSLTP(trade, currentPrice);
+        }
+
+        // Skip manual sell for STOP_LOSS/TRAILING_STOP when we have exchange stop (exchange handles it)
+        const useExchangeForStop = !DRY_RUN && trade.stopOrderId && realState.useExchangeStopLoss;
+        const isStopExit = exitCheck && (exitCheck.reason === 'STOP_LOSS' || exitCheck.reason === 'TRAILING_STOP');
+
+        if (exitCheck && exitCheck.hit && !(useExchangeForStop && isStopExit)) {
+          logger.info(`${exitCheck.reason} hit`, {
+            tradeId: trade.id,
+            symbol: sym,
+            exitPrice: exitCheck.exitPrice,
             currentPrice,
           });
 
-          await executeSell(realState.currentTrade, sltpCheck.exitPrice, sltpCheck.reason);
+          const isShort = trade.side === 'SELL';
+          if (isShort) {
+            await executeCover(trade, exitCheck.exitPrice, exitCheck.reason);
+          } else {
+            await executeSell(trade, exitCheck.exitPrice, exitCheck.reason);
+          }
 
-          // Persist closed trade
+          const pnl = isShort
+            ? (trade.entryPrice - exitCheck.exitPrice) * trade.quantity
+            : (exitCheck.exitPrice - trade.entryPrice) * trade.quantity;
+
           const closedTrade = {
-            ...realState.currentTrade,
-            exitPrice: sltpCheck.exitPrice,
-            pnl: (sltpCheck.exitPrice - realState.currentTrade.entryPrice) * realState.currentTrade.quantity,
+            ...trade,
+            symbol: sym,
+            exitPrice: exitCheck.exitPrice,
+            pnl,
             status: 'CLOSED',
             closedAt: Date.now(),
           };
-          await tradePersistence.persistTradeClose(closedTrade, sltpCheck.reason, 'real');
+          await tradePersistence.persistTradeClose(closedTrade, exitCheck.reason, 'real');
           realState.lastTradeClosedAt = Date.now();
-          realState.currentTrade = null;
+
+          if (realState.symbols.length > 1) {
+            realState.openTrades = realState.openTrades.filter((t) => t.id !== trade.id);
+          } else {
+            realState.currentTrade = null;
+          }
+        } else {
+          if (realState.symbols.length > 1) {
+            const idx = realState.openTrades.findIndex((t) => t.id === trade.id);
+            if (idx >= 0) realState.openTrades[idx] = trade;
+          } else {
+            realState.currentTrade = trade;
+          }
         }
       }
       return;
     }
 
-    // No open trade - fetch candles, generate signal, maybe open
-    const candles = await fetchRealOHLCVHistory(realState.timeframe, 120);
-    if (candles.length < realState.minHistoryLength) {
-      return;
+    // No open trades - fetch candles, generate signal(s), maybe open
+    const isMultiSymbol = realState.symbols.length > 1;
+
+    if (isMultiSymbol && realState.strategy === 'goldenCrossHTF') {
+      realState.ohlcvHistoryBySymbol = {};
+      realState.htfOhlcvHistoryBySymbol = {};
+      for (const sym of realState.symbols) {
+        realState.ohlcvHistoryBySymbol[sym] = await fetchRealOHLCVHistory(sym, realState.timeframe, 120);
+        realState.htfOhlcvHistoryBySymbol[sym] = await fetchRealOHLCVHistory(sym, realState.htfTimeframe, 300);
+      }
+      realState.ohlcvHistory = realState.ohlcvHistoryBySymbol[realState.symbol];
+      realState.htfOhlcvHistory = realState.htfOhlcvHistoryBySymbol[realState.symbol];
+    } else {
+      const candles = await fetchRealOHLCVHistory(realState.symbol, realState.timeframe, 120);
+      if (candles.length < realState.minHistoryLength) return;
+      realState.ohlcvHistory = candles;
+      if (realState.strategy === 'trendPullback' || realState.strategy === 'goldenCrossHTF') {
+        realState.htfOhlcvHistory = await fetchRealOHLCVHistory(realState.symbol, realState.htfTimeframe, realState.strategy === 'goldenCrossHTF' ? 300 : 120);
+      }
     }
 
-    realState.ohlcvHistory = candles;
-    if (realState.strategy === 'trendPullback') {
-      const htfCandles = await fetchRealOHLCVHistory(realState.htfTimeframe, 120);
-      realState.htfOhlcvHistory = htfCandles;
+    const candles = realState.ohlcvHistory;
+    if (candles.length < realState.minHistoryLength) return;
+
+    // goldenCrossHTF: only process when we have a new LTF candle
+    if (realState.strategy === 'goldenCrossHTF') {
+      const latestTs = candles[candles.length - 1][0];
+      if (latestTs <= realState.lastProcessedCandleTs) return;
+      realState.lastProcessedCandleTs = latestTs;
     }
 
-    const signal = getSignal(candles, {
-      strategy: realState.strategy === 'trendPullback' ? 'trendPullback' : undefined,
-      htfOhlcv: realState.htfOhlcvHistory,
-    });
+    const openSymbols = new Set(openTrades.map((t) => t.symbol || realState.symbol));
+    let topSignals = [];
 
-    logger.info('Signal generated', {
-      signal: signal.signal,
-      price: signal.price,
-      timestamp: signal.timestamp,
-    });
+    if (isMultiSymbol && realState.strategy === 'goldenCrossHTF') {
+      const allSignals = [];
+      for (const sym of realState.symbols) {
+        const symHist = realState.ohlcvHistoryBySymbol[sym];
+        const symHtf = realState.htfOhlcvHistoryBySymbol[sym];
+        if (!symHist || symHist.length < realState.minHistoryLength) continue;
+        const s = getSignal(symHist, {
+          strategy: 'goldenCrossHTF',
+          htfOhlcv: symHtf,
+          openTrades: [],
+          symbol: sym,
+        });
+        if (['BUY', 'SELL'].includes(s.signal)) {
+          allSignals.push({
+            ...s,
+            symbol: sym,
+            action: s.signal,
+            confidence: s.confidence ?? 0.5,
+            adx: s.adx ?? s.metadata?.adx ?? 0,
+            emaDistance: s.emaDistance ?? s.metadata?.emaDistance ?? 0,
+          });
+        }
+      }
+      allSignals.sort((a, b) => {
+        if (b.adx !== a.adx) return b.adx - a.adx;
+        if (b.emaDistance !== a.emaDistance) return b.emaDistance - a.emaDistance;
+        return (b.confidence ?? 0) - (a.confidence ?? 0);
+      });
+      topSignals = allSignals.filter((s) => !openSymbols.has(s.symbol)).slice(0, realState.maxOpenTrades);
+      if (topSignals.length > 0) {
+        logger.info('Multi-symbol signals', { selected: topSignals.map((s) => ({ symbol: s.symbol, action: s.action, adx: s.adx })) });
+      }
+    } else {
+      const signal = getSignal(candles, {
+        strategy: realState.strategy === 'trendPullback' ? 'trendPullback' : realState.strategy === 'goldenCrossHTF' ? 'goldenCrossHTF' : undefined,
+        htfOhlcv: realState.htfOhlcvHistory,
+        openTrades: [],
+        symbol: realState.strategy === 'goldenCrossHTF' ? realState.symbol : undefined,
+      });
+      if (['BUY', 'SELL'].includes(signal.signal)) {
+        topSignals = [{ ...signal, symbol: realState.symbol, action: signal.signal }];
+      }
+      logger.info('Signal generated', { signal: signal.signal, price: signal.price, timestamp: signal.timestamp });
+    }
 
-    if (signal.signal !== 'BUY') return;
-
-    // Check cooldown
-    const riskState = {
-      lastTradeClosedAt: realState.lastTradeClosedAt,
-    };
     const riskOverrides = realState.strategy === 'trendPullback'
       ? { maxTradesPerDay: 2, tradeCooldownMs: 30 * 60 * 1000 }
-      : null;
+      : realState.strategy === 'goldenCrossHTF'
+        ? { maxTradesPerDay: 10, tradeCooldownMs: 0, maxDrawdown: 1 }
+        : null;
+    const riskState = { lastTradeClosedAt: realState.lastTradeClosedAt };
     const { allowed: cooldownOk } = require('../risk').canOpenTrade(riskState, riskOverrides);
     if (!cooldownOk) return;
 
-    const { allowed, reason } = canOpenRealTrade();
-    if (!allowed) {
-      logger.info('Trade blocked by risk rules', { reason });
-      return;
-    }
+    for (const sig of topSignals) {
+      const side = sig.action || sig.signal;
+      if (side !== 'BUY' && side !== 'SELL') continue;
+      if (realState.longOnly && side === 'SELL') continue;
 
-    const riskParams = (realState.strategy === 'trendPullback' && signal.stopLoss && signal.takeProfit)
-      ? getTradeRiskParamsCustom(signal.price, 'BUY', signal.stopLoss, signal.takeProfit, realState.balance)
-      : getTradeRiskParams(signal.price, 'BUY', realState.balance);
+      const { allowed, reason } = canOpenRealTrade(realState.symbols.length > 1 ? sig.symbol : null);
+      if (!allowed) {
+        logger.info('Trade blocked by risk rules', { symbol: sig.symbol, reason });
+        continue;
+      }
 
-    const { stopLoss, takeProfit } = riskParams;
-    const positionSize = (realState.strategy === 'trendPullback' && stopLoss)
-      ? getRealPositionSizeWithStop(realState.balance, signal.price, stopLoss)
-      : getRealPositionSize(realState.balance, signal.price, 'BUY');
+      // Use live ticker price for entry (not stale candle close)
+      let entryPrice = sig.price;
+      try {
+        const tickerData = await fetchTicker(symbolToMarket(sig.symbol));
+        const livePrice = parseFloat(tickerData?.last_price || tickerData?.bid || tickerData?.ask || 0);
+        if (livePrice > 0) entryPrice = livePrice;
+      } catch (err) {
+        logger.warn('Could not fetch live price for entry, using candle close', { symbol: sig.symbol, error: err.message });
+      }
 
-    if (positionSize <= 0) {
-      logger.warn('Position size is 0, skipping');
-      return;
-    }
+      // Recalc stopLoss for live price (goldenCrossHTF uses %)
+      let stopLossForRisk = sig.stopLoss;
+      if (realState.strategy === 'goldenCrossHTF' && sig.stopLoss) {
+        const cfg = require('../strategy/goldenCrossHTFStrategy').getConfig();
+        stopLossForRisk = side === 'BUY'
+          ? entryPrice * (1 - cfg.trailPercent)
+          : entryPrice * (1 + cfg.trailPercent);
+      } else if (realState.strategy === 'trendPullback' && sig.stopLoss && sig.atr) {
+        const diff = entryPrice - sig.price;
+        stopLossForRisk = side === 'BUY' ? sig.stopLoss + diff : sig.stopLoss + diff;
+      }
 
-    const trade = await executeBuy(signal.price, positionSize, stopLoss, takeProfit);
-    trade.strategy = realState.strategy === 'trendPullback' ? 'trendPullback' : 'default';
-    trade.atrAtEntry = signal.atr;
-    trade.initialStopLoss = stopLoss;
-    trade.initialRiskDistance = Math.abs(signal.price - stopLoss);
-    realState.currentTrade = trade;
+      const useCustomRisk = (realState.strategy === 'trendPullback' && sig.stopLoss && sig.takeProfit)
+        || (realState.strategy === 'goldenCrossHTF' && sig.stopLoss);
+      const riskParams = useCustomRisk
+        ? getTradeRiskParamsCustom(
+            entryPrice,
+            side,
+            stopLossForRisk,
+            sig.takeProfit || Infinity,
+            realState.balance,
+            sig.suggestedRiskPercent ?? 0.01
+          )
+        : getTradeRiskParams(entryPrice, side, realState.balance);
 
-    // Persist trade
-    await tradePersistence.persistTradeOpen(
-      { ...trade, symbol: realState.symbol },
-      'real',
-      realState.symbol
-    );
+      const { stopLoss, takeProfit } = riskParams;
+      const positionSize = useCustomRisk && stopLoss
+        ? getRealPositionSizeWithStop(realState.balance, entryPrice, stopLoss)
+        : getRealPositionSize(realState.balance, entryPrice, side);
 
-    // Deduct from balance (for tracking; real balance comes from API)
-    if (DRY_RUN) {
-      const cost = trade.entryPrice * trade.quantity;
-      realState.balance -= cost;
+      if (positionSize <= 0) {
+        logger.warn('Position size is 0, skipping', { symbol: sig.symbol });
+        continue;
+      }
+
+      let trade;
+      if (side === 'SELL') {
+        trade = await executeShort(sig.symbol, entryPrice, positionSize, stopLoss);
+      } else {
+        trade = await executeBuy(sig.symbol, entryPrice, positionSize, stopLoss, takeProfit);
+      }
+
+      trade.strategy = realState.strategy === 'trendPullback' ? 'trendPullback' : realState.strategy === 'goldenCrossHTF' ? 'goldenCrossHTF' : 'default';
+      trade.side = side;
+      trade.symbol = sig.symbol;
+      trade.atrAtEntry = sig.atr;
+      trade.initialStopLoss = stopLoss;
+      trade.initialRiskDistance = Math.abs(entryPrice - stopLoss);
+      if (realState.strategy === 'goldenCrossHTF') {
+        trade.highestPrice = side === 'BUY' ? entryPrice : undefined;
+        trade.lowestPrice = side === 'SELL' ? entryPrice : undefined;
+        trade.candleCount = 0;
+      }
+
+      if (realState.symbols.length > 1) {
+        realState.openTrades.push(trade);
+      } else {
+        realState.currentTrade = trade;
+      }
+
+      await tradePersistence.persistTradeOpen({ ...trade, symbol: sig.symbol }, 'real', sig.symbol);
+
+      if (DRY_RUN && side === 'BUY') {
+        realState.balance -= trade.entryPrice * trade.quantity;
+      }
     }
   } catch (err) {
     logger.error('Real trading tick error', { error: err.message });
@@ -423,13 +816,24 @@ async function startRealTrading(options = {}) {
     return { success: false, message: 'Real trading already running' };
   }
 
-  realState.symbol = options.symbol || 'BTC/USDT';
+  const symbolsParam = options.symbols && options.symbols.length > 0 ? options.symbols : null;
+  realState.symbols = symbolsParam || [options.symbol || 'BTC/USDT'];
+  realState.symbol = realState.symbols[0];
+  realState.maxOpenTrades = options.maxOpenTrades ?? (realState.symbols.length > 1 ? configMaxOpenTrades : 1);
   realState.strategy = options.strategy || null;
+  realState.longOnly = options.longOnly ?? false;
+  realState.useExchangeStopLoss = options.useExchangeStopLoss ?? true;
   if (realState.strategy === 'trendPullback') {
     realState.timeframe = '5m';
     realState.htfTimeframe = '15m';
+    realState.minHistoryLength = 50;
+  } else if (realState.strategy === 'goldenCrossHTF') {
+    realState.timeframe = '4h';
+    realState.htfTimeframe = '1d';
+    realState.minHistoryLength = GOLDEN_CROSS_MIN_LTF;
   } else {
     realState.timeframe = options.timeframe || '5m';
+    realState.minHistoryLength = 50;
   }
   realState.quoteCurrency = options.quoteCurrency || 'USDT';
   realState.killSwitchTriggered = false;
@@ -447,14 +851,22 @@ async function startRealTrading(options = {}) {
   realState.dailyLoss = 0;
   realState.lastDayReset = getStartOfDay(Date.now());
   realState.currentTrade = null;
+  realState.openTrades = [];
+  realState.lastProcessedCandleTs = 0;
+  realState.lastProcessedCandleTsBySymbol = {};
+  realState.ohlcvHistoryBySymbol = {};
+  realState.htfOhlcvHistoryBySymbol = {};
 
   realState.isRunning = true;
   realState.intervalId = setInterval(runRealTick, INTERVAL_MS);
 
   logger.info('Real trading started', {
     symbol: realState.symbol,
+    symbols: realState.symbols,
+    strategy: realState.strategy,
     timeframe: realState.timeframe,
     dryRun: DRY_RUN,
+    longOnly: realState.longOnly,
     balance: realState.balance,
   });
 
@@ -486,16 +898,21 @@ function stopRealTrading() {
  * Get real trading status
  */
 function getRealStatus() {
+  const openTrades = realState.openTrades.length > 0 ? realState.openTrades : (realState.currentTrade ? [realState.currentTrade] : []);
   return {
     isRunning: realState.isRunning,
     balance: roundTo(realState.balance, 2),
     openTrade: realState.currentTrade,
+    openTrades,
+    symbols: realState.symbols,
     dailyLoss: roundTo(realState.dailyLoss, 2),
     peakBalance: realState.peakBalance,
     killSwitchTriggered: realState.killSwitchTriggered,
     dryRun: DRY_RUN,
     symbol: realState.symbol,
+    strategy: realState.strategy,
     timeframe: realState.timeframe,
+    longOnly: realState.longOnly,
   };
 }
 

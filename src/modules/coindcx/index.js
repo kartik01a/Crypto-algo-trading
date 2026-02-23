@@ -114,6 +114,8 @@ function symbolToMarket(symbol) {
     'BTC/INR': 'BTCINR',
     'ETH/USDT': 'ETHUSDT',
     'ETH/INR': 'ETHINR',
+    'SOL/USDT': 'SOLUSDT',
+    'SOL/INR': 'SOLINR',
   };
   return mapping[symbol] || symbol.replace('/', '');
 }
@@ -125,10 +127,11 @@ function symbolToMarket(symbol) {
  * @param {string} params.side - 'buy' or 'sell'
  * @param {number} params.quantity - Order quantity (in base currency for buy)
  * @param {number} [params.price] - Limit price (required for limit_order)
- * @param {string} [params.orderType] - 'limit_order' or 'market_order'
+ * @param {string} [params.orderType] - 'limit_order' | 'market_order' | 'stop_limit'
+ * @param {number} [params.stopPrice] - Trigger price (required for stop_limit)
  * @returns {Promise<Object>} Order response { id, status, ... }
  */
-async function placeOrder({ symbol, side, quantity, price, orderType = 'limit_order' }) {
+async function placeOrder({ symbol, side, quantity, price, orderType = 'limit_order', stopPrice }) {
   const market = symbolToMarket(symbol);
   const sideLower = side.toLowerCase();
 
@@ -144,8 +147,38 @@ async function placeOrder({ symbol, side, quantity, price, orderType = 'limit_or
     body.price_per_unit = price;
   }
 
+  if (orderType === 'stop_limit') {
+    if (stopPrice == null) throw new Error('stopPrice required for stop_limit');
+    body.stop_price = stopPrice;
+    body.price_per_unit = price != null ? price : stopPrice;
+  }
+
   const data = await authenticatedRequest('/exchange/v1/orders/create', body);
   return data;
+}
+
+/**
+ * Place stop-loss order (stop_limit) on CoinDCX
+ * For LONG: sell when price drops to stopPrice
+ * For SHORT cover: buy when price rises to stopPrice
+ * @param {Object} params
+ * @param {string} params.symbol - Trading pair
+ * @param {string} params.side - 'buy' or 'sell'
+ * @param {number} params.quantity - Order quantity
+ * @param {number} params.stopPrice - Trigger price
+ * @param {number} [params.limitPrice] - Limit price (defaults to stopPrice; use slightly worse for fill certainty)
+ * @returns {Promise<Object>} Order response { id, status, ... }
+ */
+async function placeStopLossOrder({ symbol, side, quantity, stopPrice, limitPrice }) {
+  const price = limitPrice != null ? limitPrice : stopPrice;
+  return placeOrder({
+    symbol,
+    side,
+    quantity,
+    price,
+    orderType: 'stop_limit',
+    stopPrice,
+  });
 }
 
 /**
@@ -224,8 +257,10 @@ function symbolToPair(symbol) {
   const mapping = {
     'BTC/USDT': 'B-BTC_USDT',
     'ETH/USDT': 'B-ETH_USDT',
+    'SOL/USDT': 'B-SOL_USDT',
     'BTC/INR': 'I-BTC_INR',
     'ETH/INR': 'I-ETH_INR',
+    'SOL/INR': 'I-SOL_INR',
   };
   return mapping[symbol] || `B-${symbol.replace('/', '_')}`;
 }
@@ -235,6 +270,7 @@ module.exports = {
   getBalance,
   getAvailableBalance,
   placeOrder,
+  placeStopLossOrder,
   getOrderStatus,
   cancelOrder,
   fetchTicker,

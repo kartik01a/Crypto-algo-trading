@@ -17,9 +17,9 @@ const tradeSchema = new mongoose.Schema(
     exitPrice: { type: Number, default: null },
     quantity: { type: Number, required: true },
     stopLoss: { type: Number, required: true },
-    takeProfit: { type: Number, required: true },
+    takeProfit: { type: Number, default: null }, // null for strategies using trailing stop only (e.g. goldenCrossHTF)
     pnl: { type: Number, default: 0 },
-    fees: { type: Number, default: 0 },
+    fees: { type: Number, default: 0 }, // Total trading fees (entry + exit) in quote currency (USDT for BTC/USDT, INR for BTC/INR)
     status: { type: String, required: true, enum: ['OPEN', 'CLOSED'], default: 'OPEN' },
     reason: { type: String, enum: ['SL', 'TP', 'MANUAL', null], default: null },
     orderId: { type: String, default: null },

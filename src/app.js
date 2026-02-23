@@ -59,7 +59,9 @@ app.post('/api/backtest', async (req, res) => {
 
 /**
  * POST /api/paper/start
- * Body: { symbol?, timeframe?, initialBalance? }
+ * Body: { symbol?, symbols?, timeframe?, strategy?, initialBalance?, maxOpenTrades?, longOnly? }
+ * symbols: ['BTC/USDT','ETH/USDT','SOL/USDT'] for multi-symbol (goldenCrossHTF)
+ * strategy: 'trendPullback' | 'goldenCrossHTF' | null (default EMA+RSI)
  */
 app.post('/api/paper/start', async (req, res) => {
   try {
@@ -170,7 +172,10 @@ app.get('/api/performance', async (req, res) => {
 
 /**
  * POST /api/real/start
- * Body: { symbol?, timeframe?, quoteCurrency?, initialBalance? (DRY_RUN only) }
+ * Body: { symbol?, symbols?, strategy?, quoteCurrency?, initialBalance? (DRY_RUN), longOnly?, maxOpenTrades?, useExchangeStopLoss? }
+ * symbols: ['BTC/USDT','ETH/USDT','SOL/USDT'] for multi-symbol (goldenCrossHTF)
+ * strategy: 'trendPullback' | 'goldenCrossHTF' | null
+ * longOnly: true = skip SELL signals (spot-only, no shorting)
  */
 app.post('/api/real/start', async (req, res) => {
   try {

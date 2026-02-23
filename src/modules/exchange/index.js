@@ -1,10 +1,11 @@
 /**
- * Exchange module - CCXT wrapper for Binance
+ * Exchange module - CCXT wrapper for Binance, CoinDCX for INR pairs
  * Fetches OHLCV data and ticker information
  */
 
 const ccxt = require('ccxt');
 const config = require('../../config');
+const { fetchCandles: fetchCoinDCXCandles, symbolToPair } = require('../coindcx');
 
 let exchangeInstance = null;
 
@@ -21,15 +22,35 @@ function getExchange() {
 }
 
 /**
+ * Check if symbol is INR pair (e.g. ETH/INR, BTC/INR)
+ */
+function isINRPair(symbol) {
+  return symbol && symbol.toUpperCase().endsWith('/INR');
+}
+
+/**
+ * Convert CoinDCX candle to OHLCV array format
+ */
+function candleToOHLCV(candle) {
+  return [candle.time, candle.open, candle.high, candle.low, candle.close, candle.volume || 0];
+}
+
+/**
  * Fetch OHLCV candle data
- * @param {string} symbol - Trading pair (e.g., 'BTC/USDT')
- * @param {string} timeframe - Candle timeframe (e.g., '5m', '1h')
+ * Uses CoinDCX for INR pairs (paper/backtest with Indian capital); Binance for USDT
+ * @param {string} symbol - Trading pair (e.g., 'BTC/USDT' or 'ETH/INR')
+ * @param {string} timeframe - Candle timeframe (e.g., '5m', '1h', '4h')
  * @param {number} [since] - Start timestamp in ms
  * @param {number} [limit] - Number of candles to fetch (default 100)
  * @returns {Promise<Array>} Array of [timestamp, open, high, low, close, volume]
  */
 async function fetchOHLCV(symbol, timeframe, since = undefined, limit = 100) {
   try {
+    if (isINRPair(symbol)) {
+      const pair = symbolToPair(symbol);
+      const candles = await fetchCoinDCXCandles(pair, timeframe, limit);
+      return candles.map(candleToOHLCV).sort((a, b) => a[0] - b[0]);
+    }
     const exchange = getExchange();
     const ohlcv = await exchange.fetchOHLCV(symbol, timeframe, since, limit);
     return ohlcv;
@@ -45,6 +66,16 @@ async function fetchOHLCV(symbol, timeframe, since = undefined, limit = 100) {
  */
 async function fetchTicker(symbol) {
   try {
+    if (isINRPair(symbol)) {
+      const { fetchTicker: fetchCoinDCXTicker, symbolToMarket } = require('../coindcx');
+      const market = symbolToMarket(symbol);
+      const ticker = await fetchCoinDCXTicker(market);
+      return {
+        last: parseFloat(ticker.last_price || ticker.bid || 0),
+        bid: parseFloat(ticker.bid || 0),
+        ask: parseFloat(ticker.ask || 0),
+      };
+    }
     const exchange = getExchange();
     const ticker = await exchange.fetchTicker(symbol);
     return ticker;
@@ -70,4 +101,5 @@ module.exports = {
   fetchOHLCV,
   fetchTicker,
   fetchLatestCandle,
+  isINRPair,
 };

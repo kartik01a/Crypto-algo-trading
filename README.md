@@ -58,6 +58,36 @@ POST /api/paper/stop    # Stop paper trading
 GET  /api/paper/status  # Get status
 ```
 
+**Start with Golden Cross HTF strategy:**
+```bash
+curl -X POST http://localhost:3000/api/paper/start \
+  -H "Content-Type: application/json" \
+  -d '{"symbol": "BTC/USDT", "strategy": "goldenCrossHTF", "initialBalance": 10000}'
+```
+
+**Long-only (BUY signals only, no shorts):**
+```bash
+curl -X POST http://localhost:3000/api/paper/start \
+  -H "Content-Type: application/json" \
+  -d '{"symbol": "ETH/USDT", "strategy": "goldenCrossHTF", "initialBalance": 10000, "longOnly": true}'
+```
+
+**INR pairs (for 10000 INR capital):**
+```bash
+curl -X POST http://localhost:3000/api/paper/start \
+  -H "Content-Type: application/json" \
+  -d '{"symbols": ["ETH/INR","BTC/INR"], "strategy": "goldenCrossHTF", "initialBalance": 10000, "longOnly": true}'
+```
+
+**Multi-symbol (Golden Cross HTF):**
+```bash
+curl -X POST http://localhost:3000/api/paper/start \
+  -H "Content-Type: application/json" \
+  -d '{"symbols": ["BTC/USDT","ETH/USDT","SOL/USDT"], "strategy": "goldenCrossHTF", "initialBalance": 10000, "maxOpenTrades": 3}'
+```
+
+Strategies: `trendPullback` (5m+15m), `goldenCrossHTF` (4h+1d), or omit for default EMA+RSI.
+
 ### Portfolio & Trades
 
 ```bash
@@ -74,6 +104,24 @@ POST /api/real/start   # Start real trading
 POST /api/real/stop    # Stop real trading
 GET  /api/real/status  # Status: isRunning, balance, openTrade, dailyLoss
 ```
+
+**Start with Golden Cross HTF:**
+```bash
+curl -X POST http://localhost:3000/api/real/start \
+  -H "Content-Type: application/json" \
+  -d '{"symbol": "BTC/USDT", "strategy": "goldenCrossHTF", "longOnly": true}'
+```
+
+**Multi-symbol (Golden Cross HTF):**
+```bash
+curl -X POST http://localhost:3000/api/real/start \
+  -H "Content-Type: application/json" \
+  -d '{"symbols": ["BTC/USDT","ETH/USDT","SOL/USDT"], "strategy": "goldenCrossHTF", "longOnly": true, "maxOpenTrades": 3}'
+```
+
+- `strategy`: `goldenCrossHTF` (4h+1d) | `trendPullback` (5m+15m) | omit for default
+- `longOnly`: `true` = skip SELL signals (use for spot-only; CoinDCX spot does not support shorting)
+- `useExchangeStopLoss`: `true` (default) = place stop_limit on CoinDCX for exchange-side SL; `false` = app-managed SL
 
 **Environment variables:**
 - `COINDCX_API_KEY` - CoinDCX API key
