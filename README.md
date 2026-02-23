@@ -8,7 +8,7 @@ Production-ready crypto algorithmic trading backend built with Node.js and Expre
 - **Risk Management**: Position sizing, stop loss, take profit, daily limits
 - **Backtesting**: Historical simulation with realistic fees and slippage
 - **Paper Trading**: Live simulation running every 1 minute
-- **Real Trading**: CoinDCX API integration with live orders
+- **Real Trading**: Binance Futures API with native trailing stop (no app dependency for exits)
 - **Portfolio Tracking**: Balance, open/closed trades, equity curve
 
 ## Tech Stack
@@ -16,7 +16,7 @@ Production-ready crypto algorithmic trading backend built with Node.js and Expre
 - Node.js + Express
 - MongoDB + Mongoose (trade persistence)
 - ccxt (Binance for backtest/paper)
-- CoinDCX API (real trading)
+- Binance Futures API (real trading)
 - technicalindicators
 
 ## Installation
@@ -97,7 +97,9 @@ GET /api/trades/:mode  # Trades by mode
 GET /api/performance   # Performance metrics (?mode=)
 ```
 
-### Real Trading (CoinDCX)
+### Real Trading (Binance Futures)
+
+App places entry + trailing stop once; Binance handles exit natively—no app dependency for stop updates.
 
 ```bash
 POST /api/real/start   # Start real trading
@@ -120,12 +122,13 @@ curl -X POST http://localhost:3000/api/real/start \
 ```
 
 - `strategy`: `goldenCrossHTF` (4h+1d) | `trendPullback` (5m+15m) | omit for default
-- `longOnly`: `true` = skip SELL signals (use for spot-only; CoinDCX spot does not support shorting)
-- `useExchangeStopLoss`: `true` (default) = place stop_limit on CoinDCX for exchange-side SL; `false` = app-managed SL
+- `longOnly`: `true` = skip SELL signals (longs only)
+- `useExchangeStopLoss`: `true` (default) = place trailing stop on Binance; `false` = app-managed SL
+- `trailPercent`: `0.02` (default) = 2% trailing stop on Binance
 
 **Environment variables:**
-- `COINDCX_API_KEY` - CoinDCX API key
-- `COINDCX_SECRET` - CoinDCX secret
+- `BINANCE_API_KEY` - Binance Futures API key
+- `BINANCE_SECRET` - Binance Futures API secret
 - `DRY_RUN=true` - Simulate orders (no real execution)
 - `KILL_SWITCH_LOSS_PERCENT=10` - Stop trading if loss exceeds %
 
@@ -152,12 +155,12 @@ curl -X POST http://localhost:3000/api/real/start \
     /strategy  - EMA + RSI strategy
     /risk      - Risk management
     /exchange  - ccxt exchange wrapper (Binance)
-    /coindcx   - CoinDCX API integration
+    /binance   - Binance Futures API (real trading)
     /execution - Trade execution (simulation)
     /portfolio - Portfolio tracking
     /backtest  - Backtest engine
     /paper     - Paper trading engine
-    /real      - Real trading engine (CoinDCX)
+    /real      - Real trading engine (Binance Futures)
   /services
   /utils
   app.js

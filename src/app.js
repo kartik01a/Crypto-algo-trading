@@ -167,12 +167,12 @@ app.get('/api/performance', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// Real Trading API (CoinDCX)
+// Real Trading API (Binance Futures)
 // ---------------------------------------------------------------------------
 
 /**
  * POST /api/real/start
- * Body: { symbol?, symbols?, strategy?, quoteCurrency?, initialBalance? (DRY_RUN), longOnly?, maxOpenTrades?, useExchangeStopLoss? }
+ * Body: { symbol?, symbols?, strategy?, quoteCurrency?, initialBalance? (DRY_RUN), longOnly?, maxOpenTrades?, useExchangeStopLoss?, trailPercent?, leverage? }
  * symbols: ['BTC/USDT','ETH/USDT','SOL/USDT'] for multi-symbol (goldenCrossHTF)
  * strategy: 'trendPullback' | 'goldenCrossHTF' | null
  * longOnly: true = skip SELL signals (spot-only, no shorting)
@@ -236,7 +236,7 @@ app.listen(PORT, () => {
   console.log(`  GET  /api/trades - Trades from DB (optional ?mode=)`);
   console.log(`  GET  /api/trades/:mode - Trades by mode`);
   console.log(`  GET  /api/performance - Performance metrics`);
-  console.log(`  POST /api/real/start - Start real trading (CoinDCX)`);
+  console.log(`  POST /api/real/start - Start real trading (Binance Futures)`);
   console.log(`  POST /api/real/stop - Stop real trading`);
   console.log(`  GET  /api/real/status - Real trading status`);
 });

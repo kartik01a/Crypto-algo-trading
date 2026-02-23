@@ -75,7 +75,7 @@ module.exports = {
     intervalMs: 60000, // 1 minute
   },
 
-  // Real trading (CoinDCX)
+  // Real trading (Binance Futures)
   real: {
     intervalMs: 60000, // 1 minute
     maxCapitalPerTrade: 0.05, // 5%

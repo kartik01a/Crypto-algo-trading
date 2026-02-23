@@ -1,7 +1,8 @@
 /**
  * Real Trading Engine
- * Live trading via CoinDCX with manual SL/TP monitoring
+ * Live trading via Binance Futures with native trailing stop
  *
+ * App places entry + trailing stop once; Binance handles exit - no app dependency for stop updates.
  * Safety: DRY_RUN mode, KILL_SWITCH, strict risk controls
  */
 
@@ -11,21 +12,17 @@ const logger = require('../../utils/logger');
 const tradePersistence = require('../../services/tradePersistence');
 const {
   getAvailableBalance,
-  placeOrder,
-  placeStopLossOrder,
+  setLeverage,
+  placeMarketOrder,
+  placeTrailingStopOrder,
   getOrderStatus,
   cancelOrder,
   fetchCandles,
   fetchTicker,
   symbolToMarket,
-  symbolToPair,
-} = require('../coindcx');
+  timeframeToInterval,
+} = require('../binance');
 const { getSignal } = require('../strategy');
-const { applyTrendPullbackTrailingStop } = require('../strategy/trendPullbackStrategy');
-const {
-  shouldExitTrade: shouldExitTradeGoldenCross,
-  updateTrailingStop: updateTrailingStopGoldenCross,
-} = require('../strategy/goldenCrossHTFStrategy');
 const {
   calculateStopLoss,
   calculateTakeProfit,
@@ -74,32 +71,19 @@ let realState = {
   longOnly: false,
   lastProcessedCandleTs: 0,
   lastProcessedCandleTsBySymbol: {},
-  useExchangeStopLoss: true, // Place stop_limit on CoinDCX; when false, app-managed SL
+  useExchangeStopLoss: true, // Place trailing stop on Binance; when false, app-managed SL
+  trailPercent: 0.02, // 2% trailing for Binance (callbackRate = 2)
+  leverage: 3, // 3x leverage (set via API before each order)
 };
 
 /**
- * Convert CoinDCX candle to OHLCV array format
- * CoinDCX: { open, high, low, close, volume, time }
- * Strategy expects: [timestamp, open, high, low, close, volume]
- */
-function candleToOHLCV(candle) {
-  return [
-    candle.time,
-    candle.open,
-    candle.high,
-    candle.low,
-    candle.close,
-    candle.volume || 0,
-  ];
-}
-
-/**
- * Fetch OHLCV history from CoinDCX for a symbol
+ * Fetch OHLCV history from Binance Futures for a symbol
+ * Returns: [[timestamp, open, high, low, close, volume], ...]
  */
 async function fetchRealOHLCVHistory(symbol, timeframe, limit = 100) {
-  const pair = symbolToPair(symbol);
-  const candles = await fetchCandles(pair, timeframe, limit);
-  return candles.map(candleToOHLCV).sort((a, b) => a[0] - b[0]);
+  const interval = timeframeToInterval(timeframe);
+  const candles = await fetchCandles(symbol, interval, limit);
+  return candles.sort((a, b) => a[0] - b[0]);
 }
 
 /**
@@ -192,38 +176,38 @@ async function executeBuy(symbol, price, quantity, stopLoss, takeProfit) {
   }
 
   try {
-    const order = await placeOrder({
+    const lev = realState.leverage ?? 3;
+    await setLeverage(symbol, lev);
+    logger.info('Leverage set', { symbol, leverage: lev });
+    const order = await placeMarketOrder({
       symbol,
-      side: 'buy',
+      side: 'BUY',
       quantity,
-      price,
-      orderType: 'limit_order',
     });
 
-    trade.orderId = order.id || order.order_id;
+    trade.orderId = order.orderId || order.order_id;
     trade.id = trade.orderId;
 
-    if (order.status === 'rejected' || order.message) {
-      throw new Error(order.message || 'Order rejected');
+    if (order.status === 'REJECTED' || order.msg) {
+      throw new Error(order.msg || 'Order rejected');
     }
 
     trade.status = 'OPEN';
 
-    // Place exchange-side stop loss (CoinDCX stop_limit)
-    if (stopLoss != null && realState.useExchangeStopLoss) {
+    // Place exchange-side trailing stop (Binance handles exit - no app dependency)
+    if (realState.useExchangeStopLoss) {
       try {
-        const stopOrder = await placeStopLossOrder({
+        const callbackRate = (realState.trailPercent ?? 0.02) * 100; // 2% -> 2 for Binance
+        const stopOrder = await placeTrailingStopOrder({
           symbol,
-          side: 'sell',
+          side: 'SELL',
           quantity,
-          stopPrice: stopLoss,
-          limitPrice: stopLoss * 0.999, // Slightly below for fill certainty on fast drops
+          callbackRate: Math.min(5, Math.max(0.1, callbackRate)),
         });
-        trade.stopOrderId = stopOrder.id || stopOrder.order_id;
-        logger.info('Stop loss order placed', { stopOrderId: trade.stopOrderId, stopPrice: stopLoss });
+        trade.stopOrderId = stopOrder.orderId || stopOrder.order_id;
+        logger.info('Trailing stop placed (Binance handles exit)', { stopOrderId: trade.stopOrderId, callbackRate: `${callbackRate}%` });
       } catch (err) {
-        logger.error('Failed to place stop loss order', { error: err.message, stopLoss });
-        // Trade is open; fall back to app-managed SL
+        logger.error('Failed to place trailing stop order', { error: err.message });
         trade.stopOrderId = null;
       }
     }
@@ -245,7 +229,6 @@ async function executeBuy(symbol, price, quantity, stopLoss, takeProfit) {
 
 /**
  * Execute sell/close order (close long position)
- * Uses market_order for immediate fill when SL/TP hit
  */
 async function executeSell(trade, price, reason) {
   const sym = trade.symbol || realState.symbol;
@@ -260,12 +243,18 @@ async function executeSell(trade, price, reason) {
   }
 
   try {
-    await placeOrder({
+    if (trade.stopOrderId) {
+      try {
+        await cancelOrder(sym, trade.stopOrderId);
+      } catch (e) {
+        logger.warn('Could not cancel trailing stop before manual close', { error: e.message });
+      }
+    }
+    await placeMarketOrder({
       symbol: sym,
-      side: 'sell',
+      side: 'SELL',
       quantity: trade.quantity,
-      price,
-      orderType: 'market_order',
+      reduceOnly: true,
     });
 
     logger.info('Trade closed: SELL (long)', {
@@ -298,12 +287,18 @@ async function executeCover(trade, price, reason) {
   }
 
   try {
-    await placeOrder({
+    if (trade.stopOrderId) {
+      try {
+        await cancelOrder(sym, trade.stopOrderId);
+      } catch (e) {
+        logger.warn('Could not cancel trailing stop before manual close', { error: e.message });
+      }
+    }
+    await placeMarketOrder({
       symbol: sym,
-      side: 'buy',
+      side: 'BUY',
       quantity: trade.quantity,
-      price,
-      orderType: 'market_order',
+      reduceOnly: true,
     });
 
     logger.info('Trade closed: BUY (short cover)', {
@@ -322,11 +317,9 @@ async function executeCover(trade, price, reason) {
 
 /**
  * Execute short order (open short position)
- * Note: Requires margin/futures on CoinDCX; spot-only will fail
- * @param {string} symbol - Trading pair
+ * Binance Futures supports shorts natively
  */
 async function executeShort(symbol, price, quantity, stopLoss) {
-  // Short: stop loss is buy/cover when price rises
   if (DRY_RUN) {
     logger.info('DRY_RUN: Simulated SHORT (open)', {
       symbol,
@@ -348,17 +341,18 @@ async function executeShort(symbol, price, quantity, stopLoss) {
   }
 
   try {
-    const order = await placeOrder({
+    const lev = realState.leverage ?? 3;
+    await setLeverage(symbol, lev);
+    logger.info('Leverage set', { symbol, leverage: lev });
+    const order = await placeMarketOrder({
       symbol,
-      side: 'sell',
+      side: 'SELL',
       quantity,
-      price,
-      orderType: 'limit_order',
     });
 
     const trade = {
-      id: order.id || order.order_id,
-      orderId: order.id || order.order_id,
+      id: String(order.orderId || order.order_id),
+      orderId: String(order.orderId || order.order_id),
       status: 'OPEN',
       symbol,
       entryPrice: price,
@@ -368,19 +362,19 @@ async function executeShort(symbol, price, quantity, stopLoss) {
       openedAt: Date.now(),
     };
 
-    if (stopLoss != null && realState.useExchangeStopLoss) {
+    if (realState.useExchangeStopLoss) {
       try {
-        const stopOrder = await placeStopLossOrder({
+        const callbackRate = (realState.trailPercent ?? 0.02) * 100;
+        const stopOrder = await placeTrailingStopOrder({
           symbol,
-          side: 'buy',
+          side: 'BUY',
           quantity,
-          stopPrice: stopLoss,
-          limitPrice: stopLoss * 1.001,
+          callbackRate: Math.min(5, Math.max(0.1, callbackRate)),
         });
-        trade.stopOrderId = stopOrder.id || stopOrder.order_id;
-        logger.info('Stop loss order placed (short)', { stopOrderId: trade.stopOrderId, stopPrice: stopLoss });
+        trade.stopOrderId = stopOrder.orderId || stopOrder.order_id;
+        logger.info('Trailing stop placed (short, Binance handles exit)', { stopOrderId: trade.stopOrderId, callbackRate: `${callbackRate}%` });
       } catch (err) {
-        logger.error('Failed to place stop loss order (short)', { error: err.message, stopLoss });
+        logger.error('Failed to place trailing stop order (short)', { error: err.message });
         trade.stopOrderId = null;
       }
     }
@@ -487,13 +481,13 @@ async function runRealTick() {
         const currentPrice = parseFloat(tickerData?.last_price || tickerData?.bid || 0);
         if (currentPrice <= 0) continue;
 
-        // 1. Check if exchange stop order filled (when using exchange-side SL)
+        // 1. Check if Binance trailing stop order filled (exchange handles exit)
         if (!DRY_RUN && trade.stopOrderId && realState.useExchangeStopLoss) {
           try {
-            const stopStatus = await getOrderStatus(trade.stopOrderId);
-            const status = (stopStatus.status || stopStatus.order_status || '').toLowerCase();
-            if (status === 'filled' || status === 'partially_cancelled') {
-              const exitPrice = parseFloat(stopStatus.average_price || stopStatus.price_per_unit || trade.stopLoss) || trade.stopLoss;
+            const stopStatus = await getOrderStatus(sym, trade.stopOrderId);
+            const status = (stopStatus.status || stopStatus.order_status || '').toUpperCase();
+            if (status === 'FILLED' || status === 'PARTIALLY_FILLED') {
+              const exitPrice = parseFloat(stopStatus.avgPrice || stopStatus.average_price || trade.stopLoss) || trade.stopLoss;
               logger.info('Exchange stop order filled', { tradeId: trade.id, symbol: sym, exitPrice, status });
 
               const isShort = trade.side === 'SELL';
@@ -524,17 +518,9 @@ async function runRealTick() {
           }
         }
 
-        // 2. Trailing stop update (and update exchange stop when changed)
-        if (trade.strategy === 'trendPullback') {
-          const ltfCandles = await fetchRealOHLCVHistory(sym, realState.timeframe, 120);
-          const htfHist = realState.htfOhlcvHistoryBySymbol?.[sym] || realState.htfOhlcvHistory;
-          const mtfSignal = getSignal(ltfCandles, {
-            strategy: 'trendPullback',
-            htfOhlcv: htfHist,
-          });
-          const atr = mtfSignal.atr;
-          trade = applyTrendPullbackTrailingStop(trade, currentPrice, atr);
-        } else if (trade.strategy === 'goldenCrossHTF') {
+        // 2. Binance handles trailing stop natively - no app updates needed.
+        //    Only update candleCount for MAX_HOLD check (goldenCrossHTF).
+        if (trade.strategy === 'goldenCrossHTF') {
           const candles = await fetchRealOHLCVHistory(sym, realState.timeframe, 10);
           if (candles.length >= 2) {
             const latestTs = candles[candles.length - 1][0];
@@ -542,34 +528,12 @@ async function runRealTick() {
             if (latestTs > lastTs) {
               if (!realState.lastProcessedCandleTsBySymbol) realState.lastProcessedCandleTsBySymbol = {};
               realState.lastProcessedCandleTsBySymbol[sym] = latestTs;
-              const prevCandle = candles[candles.length - 2];
-              const [, , prevHigh, prevLow] = prevCandle;
-              const updated = updateTrailingStopGoldenCross(trade, prevCandle, prevHigh, prevLow);
-              updated.candleCount = (trade.candleCount || 0) + 1;
-              const oldStop = trade.stopLoss;
-              trade = updated;
-              // Update exchange stop when trailing stop changes
-              if (!DRY_RUN && trade.stopOrderId && realState.useExchangeStopLoss && trade.stopLoss !== oldStop) {
-                try {
-                  await cancelOrder(trade.stopOrderId);
-                  const stopOrder = await placeStopLossOrder({
-                    symbol: sym,
-                    side: trade.side === 'BUY' ? 'sell' : 'buy',
-                    quantity: trade.quantity,
-                    stopPrice: trade.stopLoss,
-                    limitPrice: trade.side === 'BUY' ? trade.stopLoss * 0.999 : trade.stopLoss * 1.001,
-                  });
-                  trade.stopOrderId = stopOrder.id || stopOrder.order_id;
-                  logger.info('Trailing stop updated on exchange', { stopOrderId: trade.stopOrderId, newStop: trade.stopLoss });
-                } catch (err) {
-                  logger.error('Failed to update exchange stop', { error: err.message, newStop: trade.stopLoss });
-                }
-              }
+              trade.candleCount = (trade.candleCount || 0) + 1;
             }
           }
         }
 
-        // 3. Exit check (manual close for MAX_HOLD, TP, or when no exchange stop)
+        // 3. Exit check (manual close for MAX_HOLD only; Binance handles STOP_LOSS/TRAILING_STOP)
         let exitCheck = null;
         if (trade.strategy === 'goldenCrossHTF') {
           exitCheck = checkGoldenCrossExit(trade, currentPrice);
@@ -823,6 +787,8 @@ async function startRealTrading(options = {}) {
   realState.strategy = options.strategy || null;
   realState.longOnly = options.longOnly ?? false;
   realState.useExchangeStopLoss = options.useExchangeStopLoss ?? true;
+  realState.trailPercent = options.trailPercent ?? 0.02; // 2% for Binance trailing stop
+  realState.leverage = options.leverage ?? 3; // 2x leverage (set via API before each order)
   if (realState.strategy === 'trendPullback') {
     realState.timeframe = '5m';
     realState.htfTimeframe = '15m';
@@ -865,6 +831,7 @@ async function startRealTrading(options = {}) {
     symbols: realState.symbols,
     strategy: realState.strategy,
     timeframe: realState.timeframe,
+    leverage: realState.leverage,
     dryRun: DRY_RUN,
     longOnly: realState.longOnly,
     balance: realState.balance,
