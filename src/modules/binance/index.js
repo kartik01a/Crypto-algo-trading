@@ -13,6 +13,9 @@ const crypto = require('crypto');
 
 const BASE_URL = 'https://fapi.binance.com';
 
+// Cache symbol stepSize from exchange info (Binance requires exact precision per symbol)
+let exchangeInfoCache = null;
+
 /**
  * Generate HMAC-SHA256 signature for authenticated requests
  */
@@ -22,8 +25,9 @@ function generateSignature(secret, queryString) {
 
 /**
  * Make authenticated request to Binance Futures API
+ * @param {boolean} [returnError] - If true, return { ok, data, code, msg } instead of throwing
  */
-async function authenticatedRequest(method, path, params = {}) {
+async function authenticatedRequest(method, path, params = {}, returnError = false) {
   const apiKey = process.env.BINANCE_API_KEY;
   const secret = process.env.BINANCE_SECRET;
 
@@ -46,11 +50,12 @@ async function authenticatedRequest(method, path, params = {}) {
   const data = await response.json().catch(() => ({}));
 
   if (!response.ok) {
+    if (returnError) return { ok: false, code: data.code, msg: data.msg || data.message || response.statusText };
     const errMsg = data.msg || data.message || response.statusText;
     throw new Error(`Binance API error: ${errMsg}`);
   }
 
-  return data;
+  return returnError ? { ok: true, data } : data;
 }
 
 /**
@@ -86,14 +91,40 @@ async function setLeverage(symbol, leverage) {
 }
 
 /**
- * Format quantity for Binance (BTC: 3 decimals, ETH: 3, etc.)
+ * Fetch exchange info and cache symbol step sizes (public endpoint, no auth)
  */
-function formatQuantity(symbol, quantity) {
+async function fetchExchangeInfo() {
+  if (exchangeInfoCache) return exchangeInfoCache;
+  const url = `${BASE_URL}/fapi/v1/exchangeInfo`;
+  const response = await fetch(url);
+  const data = await response.json();
+  if (!response.ok) throw new Error(`Exchange info error: ${data.msg || response.statusText}`);
+  exchangeInfoCache = data;
+  return data;
+}
+
+/**
+ * Get stepSize for a symbol from Binance LOT_SIZE filter
+ */
+async function getStepSize(symbol) {
   const market = symbolToMarket(symbol);
-  const prec = market.startsWith('BTC') ? 3 : market.startsWith('ETH') ? 3 : 4;
+  const info = await fetchExchangeInfo();
+  const sym = (info.symbols || []).find((s) => s.symbol === market);
+  if (!sym) return 0.001; // fallback
+  const lotFilter = (sym.filters || []).find((f) => f.filterType === 'LOT_SIZE');
+  const step = parseFloat(lotFilter?.stepSize || '0.001');
+  return step > 0 ? step : 0.001;
+}
+
+/**
+ * Format quantity for Binance using symbol's stepSize (avoids "Precision is over the maximum" error)
+ */
+async function formatQuantity(symbol, quantity) {
+  const step = await getStepSize(symbol);
   const q = parseFloat(quantity);
-  const mult = Math.pow(10, prec);
-  return (Math.floor(q * mult) / mult).toFixed(prec);
+  const precision = step >= 1 ? 0 : step.toString().split('.')[1]?.replace(/0+$/, '').length || 8;
+  const rounded = Math.floor(q / step) * step;
+  return rounded.toFixed(precision);
 }
 
 /**
@@ -102,7 +133,7 @@ function formatQuantity(symbol, quantity) {
  */
 async function placeMarketOrder({ symbol, side, quantity, reduceOnly = false }) {
   const market = symbolToMarket(symbol);
-  const qty = formatQuantity(symbol, quantity);
+  const qty = await formatQuantity(symbol, quantity);
   const params = {
     symbol: market,
     side: side.toUpperCase(),
@@ -115,29 +146,28 @@ async function placeMarketOrder({ symbol, side, quantity, reduceOnly = false }) 
 
 /**
  * Place trailing stop order (exit - Binance handles from here)
+ * Uses Algo Order API - required for XRP, ADA and other symbols (regular order API rejects TRAILING_STOP_MARKET)
  * @param {Object} params - { symbol, side: 'BUY'|'SELL', quantity, callbackRate }
- * @param {number} params.callbackRate - Trail % (e.g. 0.02 = 2%, 2 = 2% for Binance)
+ * @param {number} params.callbackRate - Trail % (e.g. 2 = 2% for Binance, min 0.1 max 10)
  * @param {number} [params.activationPrice] - Optional; omit to start tracking immediately
- *
- * Binance Futures: callbackRate 0.1-5, where 1 = 1%
- * For long close: side=SELL, reduceOnly=true, triggers when price drops callbackRate from high
- * For short close: side=BUY, reduceOnly=true, triggers when price rises callbackRate from low
  */
 async function placeTrailingStopOrder({ symbol, side, quantity, callbackRate, activationPrice }) {
   const market = symbolToMarket(symbol);
-  const qty = formatQuantity(symbol, quantity);
+  const qty = await formatQuantity(symbol, quantity);
   const params = {
+    algoType: 'CONDITIONAL',
     symbol: market,
     side: side.toUpperCase(),
     type: 'TRAILING_STOP_MARKET',
     quantity: qty,
     reduceOnly: 'true',
-    callbackRate: String(callbackRate),
+    callbackRate: String(Math.min(10, Math.max(0.1, callbackRate))),
   };
   if (activationPrice != null) {
-    params.activationPrice = String(activationPrice);
+    params.activatePrice = String(activationPrice);
   }
-  return authenticatedRequest('POST', '/fapi/v1/order', params);
+  const data = await authenticatedRequest('POST', '/fapi/v1/algoOrder', params);
+  return { orderId: data.algoId, order_id: data.algoId, algoId: data.algoId };
 }
 
 /**
@@ -188,25 +218,33 @@ async function fetchTicker(symbol) {
 }
 
 /**
- * Get order status
+ * Get order status (regular or algo - tries both for compatibility with trailing stops)
  */
 async function getOrderStatus(symbol, orderId) {
   const market = symbolToMarket(symbol);
-  return authenticatedRequest('GET', '/fapi/v1/order', {
-    symbol: market,
-    orderId: String(orderId),
-  });
+  const id = String(orderId);
+  const regular = await authenticatedRequest('GET', '/fapi/v1/order', { symbol: market, orderId: id }, true);
+  if (regular.ok) return regular.data;
+  if (regular.code === -2011 || regular.msg?.includes('Unknown order') || regular.msg?.includes('Order does not exist')) {
+    const algo = await authenticatedRequest('GET', '/fapi/v1/algoOrder', { algoId: id });
+    return { status: algo.algoStatus || algo.status, order_status: algo.algoStatus, avgPrice: algo.avgPrice, average_price: algo.avgPrice, ...algo };
+  }
+  throw new Error(`Binance API error: ${regular.msg}`);
 }
 
 /**
- * Cancel order
+ * Cancel order (regular or algo - tries both for compatibility with trailing stops)
  */
 async function cancelOrder(symbol, orderId) {
   const market = symbolToMarket(symbol);
-  return authenticatedRequest('DELETE', '/fapi/v1/order', {
-    symbol: market,
-    orderId: String(orderId),
-  });
+  const id = String(orderId);
+  const regular = await authenticatedRequest('DELETE', '/fapi/v1/order', { symbol: market, orderId: id }, true);
+  if (regular.ok) return regular.data;
+  if (regular.code === -2011 || regular.msg?.includes('Unknown order') || regular.msg?.includes('Order does not exist')) {
+    const algo = await authenticatedRequest('DELETE', '/fapi/v1/algoOrder', { algoId: id });
+    return algo;
+  }
+  throw new Error(`Binance API error: ${regular.msg}`);
 }
 
 /**

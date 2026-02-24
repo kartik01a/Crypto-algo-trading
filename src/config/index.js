@@ -78,7 +78,7 @@ module.exports = {
   // Real trading (Binance Futures)
   real: {
     intervalMs: 60000, // 1 minute
-    maxCapitalPerTrade: 0.05, // 5%
+    maxCapitalPerTrade: 0.15, // 15% per trade (for small accounts; Binance min notional ~$5–20)
     maxOpenTrades: 1,
   },
 };

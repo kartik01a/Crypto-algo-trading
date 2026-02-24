@@ -39,7 +39,7 @@ const INTERVAL_MS = 60000; // 1 minute
 const GOLDEN_CROSS_MIN_LTF = 55;
 
 // Real trading risk limits (stricter than paper)
-const MAX_CAPITAL_PER_TRADE = 0.05; // 5%
+const DEFAULT_MAX_CAPITAL_PER_TRADE = 0.05; // 5%
 const RISK_PER_TRADE = 0.01; // 1%
 const MAX_DAILY_LOSS = 0.05; // 5%
 const MAX_DRAWDOWN = 0.10; // 10%
@@ -74,6 +74,7 @@ let realState = {
   useExchangeStopLoss: true, // Place trailing stop on Binance; when false, app-managed SL
   trailPercent: 0.02, // 2% trailing for Binance (callbackRate = 2)
   leverage: 3, // 3x leverage (set via API before each order)
+  maxCapitalPerTrade: null, // null = use DEFAULT_MAX_CAPITAL_PER_TRADE
 };
 
 /**
@@ -125,11 +126,18 @@ function canOpenRealTrade(symbol = null) {
 }
 
 /**
- * Calculate position size with max 5% capital per trade cap
+ * Get effective max capital per trade (from state or default)
+ */
+function getMaxCapitalPerTrade() {
+  return realState.maxCapitalPerTrade ?? config.real?.maxCapitalPerTrade ?? DEFAULT_MAX_CAPITAL_PER_TRADE;
+}
+
+/**
+ * Calculate position size with max capital per trade cap
  */
 function getRealPositionSize(balance, entryPrice, side) {
   const riskBasedSize = calculatePositionSize(balance, entryPrice, side);
-  const maxCapital = balance * MAX_CAPITAL_PER_TRADE;
+  const maxCapital = balance * getMaxCapitalPerTrade();
   const maxQuantity = maxCapital / entryPrice;
   const size = Math.min(riskBasedSize, maxQuantity);
   return roundTo(Math.max(0, size), 8);
@@ -137,7 +145,7 @@ function getRealPositionSize(balance, entryPrice, side) {
 
 function getRealPositionSizeWithStop(balance, entryPrice, stopLoss) {
   const riskBasedSize = calculatePositionSizeWithStop(balance, entryPrice, stopLoss);
-  const maxCapital = balance * MAX_CAPITAL_PER_TRADE;
+  const maxCapital = balance * getMaxCapitalPerTrade();
   const maxQuantity = maxCapital / entryPrice;
   const size = Math.min(riskBasedSize, maxQuantity);
   return roundTo(Math.max(0, size), 8);
@@ -788,7 +796,8 @@ async function startRealTrading(options = {}) {
   realState.longOnly = options.longOnly ?? false;
   realState.useExchangeStopLoss = options.useExchangeStopLoss ?? true;
   realState.trailPercent = options.trailPercent ?? 0.02; // 2% for Binance trailing stop
-  realState.leverage = options.leverage ?? 3; // 2x leverage (set via API before each order)
+  realState.leverage = options.leverage ?? 3; // 3x leverage (set via API before each order)
+  realState.maxCapitalPerTrade = options.maxCapitalPerTrade ?? config.real?.maxCapitalPerTrade ?? null;
   if (realState.strategy === 'trendPullback') {
     realState.timeframe = '5m';
     realState.htfTimeframe = '15m';
