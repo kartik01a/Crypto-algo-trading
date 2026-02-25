@@ -13,8 +13,10 @@ const tradePersistence = require('../../services/tradePersistence');
 const {
   getAvailableBalance,
   setLeverage,
+  getMinNotional,
   placeMarketOrder,
   placeTrailingStopOrder,
+  placeStopLossOrder,
   getOrderStatus,
   cancelOrder,
   fetchCandles,
@@ -72,8 +74,9 @@ let realState = {
   lastProcessedCandleTs: 0,
   lastProcessedCandleTsBySymbol: {},
   useExchangeStopLoss: true, // Place trailing stop on Binance; when false, app-managed SL
-  trailPercent: 0.02, // 2% trailing for Binance (callbackRate = 2)
-  leverage: 3, // 3x leverage (set via API before each order)
+  trailPercent: 0.03, // 3% trailing for Binance (callbackRate = 3) - lets profits run more
+  trailActivationPercent: 0.015, // 1.5% - trailing only activates after price moves this much in our favor
+  leverage: 5, // 5x leverage (set via API before each order)
   maxCapitalPerTrade: null, // null = use DEFAULT_MAX_CAPITAL_PER_TRADE
 };
 
@@ -134,19 +137,22 @@ function getMaxCapitalPerTrade() {
 
 /**
  * Calculate position size with max capital per trade cap
+ * maxCapitalPerTrade = margin % of balance; with leverage, max notional = margin * leverage
  */
 function getRealPositionSize(balance, entryPrice, side) {
   const riskBasedSize = calculatePositionSize(balance, entryPrice, side);
-  const maxCapital = balance * getMaxCapitalPerTrade();
-  const maxQuantity = maxCapital / entryPrice;
+  const leverage = realState.leverage ?? 5;
+  const maxNotional = balance * getMaxCapitalPerTrade() * leverage;
+  const maxQuantity = maxNotional / entryPrice;
   const size = Math.min(riskBasedSize, maxQuantity);
   return roundTo(Math.max(0, size), 8);
 }
 
-function getRealPositionSizeWithStop(balance, entryPrice, stopLoss) {
-  const riskBasedSize = calculatePositionSizeWithStop(balance, entryPrice, stopLoss);
-  const maxCapital = balance * getMaxCapitalPerTrade();
-  const maxQuantity = maxCapital / entryPrice;
+function getRealPositionSizeWithStop(balance, entryPrice, stopLoss, riskPercent) {
+  const riskBasedSize = calculatePositionSizeWithStop(balance, entryPrice, stopLoss, riskPercent);
+  const leverage = realState.leverage ?? 5;
+  const maxNotional = balance * getMaxCapitalPerTrade() * leverage;
+  const maxQuantity = maxNotional / entryPrice;
   const size = Math.min(riskBasedSize, maxQuantity);
   return roundTo(Math.max(0, size), 8);
 }
@@ -184,7 +190,7 @@ async function executeBuy(symbol, price, quantity, stopLoss, takeProfit) {
   }
 
   try {
-    const lev = realState.leverage ?? 3;
+    const lev = realState.leverage ?? 5;
     await setLeverage(symbol, lev);
     logger.info('Leverage set', { symbol, leverage: lev });
     const order = await placeMarketOrder({
@@ -202,18 +208,38 @@ async function executeBuy(symbol, price, quantity, stopLoss, takeProfit) {
 
     trade.status = 'OPEN';
 
-    // Place exchange-side trailing stop (Binance handles exit - no app dependency)
+    // Place exchange-side stop loss + trailing stop (Binance handles exit - no app dependency)
     if (realState.useExchangeStopLoss) {
+      // 1. Fixed stop loss (safety net - protects if app goes down)
+      if (stopLoss != null && stopLoss > 0) {
+        try {
+          const slOrder = await placeStopLossOrder({
+            symbol,
+            side: 'SELL',
+            quantity,
+            stopPrice: stopLoss,
+          });
+          trade.stopLossOrderId = slOrder.orderId || slOrder.order_id;
+          logger.info('Fixed stop loss placed', { stopLossOrderId: trade.stopLossOrderId, stopPrice: stopLoss });
+        } catch (err) {
+          logger.error('Failed to place fixed stop loss', { error: err.message });
+          trade.stopLossOrderId = null;
+        }
+      }
+      // 2. Trailing stop (profit protection) - activates after price moves in our favor
       try {
         const callbackRate = (realState.trailPercent ?? 0.02) * 100; // 2% -> 2 for Binance
+        const actPct = realState.trailActivationPercent ?? config.real?.trailActivationPercent ?? 0.015;
+        const activationPrice = price * (1 + actPct); // LONG (SELL): activate when price rises actPct% (must be > entry)
         const stopOrder = await placeTrailingStopOrder({
           symbol,
           side: 'SELL',
           quantity,
           callbackRate: Math.min(5, Math.max(0.1, callbackRate)),
+          activationPrice,
         });
         trade.stopOrderId = stopOrder.orderId || stopOrder.order_id;
-        logger.info('Trailing stop placed (Binance handles exit)', { stopOrderId: trade.stopOrderId, callbackRate: `${callbackRate}%` });
+        logger.info('Trailing stop placed (Binance handles exit)', { stopOrderId: trade.stopOrderId, callbackRate: `${callbackRate}%`, activationPrice });
       } catch (err) {
         logger.error('Failed to place trailing stop order', { error: err.message });
         trade.stopOrderId = null;
@@ -258,6 +284,13 @@ async function executeSell(trade, price, reason) {
         logger.warn('Could not cancel trailing stop before manual close', { error: e.message });
       }
     }
+    if (trade.stopLossOrderId) {
+      try {
+        await cancelOrder(sym, trade.stopLossOrderId);
+      } catch (e) {
+        logger.warn('Could not cancel fixed stop loss before manual close', { error: e.message });
+      }
+    }
     await placeMarketOrder({
       symbol: sym,
       side: 'SELL',
@@ -300,6 +333,13 @@ async function executeCover(trade, price, reason) {
         await cancelOrder(sym, trade.stopOrderId);
       } catch (e) {
         logger.warn('Could not cancel trailing stop before manual close', { error: e.message });
+      }
+    }
+    if (trade.stopLossOrderId) {
+      try {
+        await cancelOrder(sym, trade.stopLossOrderId);
+      } catch (e) {
+        logger.warn('Could not cancel fixed stop loss before manual close', { error: e.message });
       }
     }
     await placeMarketOrder({
@@ -349,7 +389,7 @@ async function executeShort(symbol, price, quantity, stopLoss) {
   }
 
   try {
-    const lev = realState.leverage ?? 3;
+    const lev = realState.leverage ?? 5;
     await setLeverage(symbol, lev);
     logger.info('Leverage set', { symbol, leverage: lev });
     const order = await placeMarketOrder({
@@ -371,16 +411,36 @@ async function executeShort(symbol, price, quantity, stopLoss) {
     };
 
     if (realState.useExchangeStopLoss) {
+      // 1. Fixed stop loss (safety net - protects if app goes down)
+      if (stopLoss != null && stopLoss > 0) {
+        try {
+          const slOrder = await placeStopLossOrder({
+            symbol,
+            side: 'BUY',
+            quantity,
+            stopPrice: stopLoss,
+          });
+          trade.stopLossOrderId = slOrder.orderId || slOrder.order_id;
+          logger.info('Fixed stop loss placed (short)', { stopLossOrderId: trade.stopLossOrderId, stopPrice: stopLoss });
+        } catch (err) {
+          logger.error('Failed to place fixed stop loss (short)', { error: err.message });
+          trade.stopLossOrderId = null;
+        }
+      }
+      // 2. Trailing stop (profit protection) - activates after price moves in our favor
       try {
         const callbackRate = (realState.trailPercent ?? 0.02) * 100;
+        const actPct = realState.trailActivationPercent ?? config.real?.trailActivationPercent ?? 0.015;
+        const activationPrice = price * (1 + actPct); // SHORT: activate when price drops actPct%
         const stopOrder = await placeTrailingStopOrder({
           symbol,
           side: 'BUY',
           quantity,
           callbackRate: Math.min(5, Math.max(0.1, callbackRate)),
+          activationPrice,
         });
         trade.stopOrderId = stopOrder.orderId || stopOrder.order_id;
-        logger.info('Trailing stop placed (short, Binance handles exit)', { stopOrderId: trade.stopOrderId, callbackRate: `${callbackRate}%` });
+        logger.info('Trailing stop placed (short, Binance handles exit)', { stopOrderId: trade.stopOrderId, callbackRate: `${callbackRate}%`, activationPrice });
       } catch (err) {
         logger.error('Failed to place trailing stop order (short)', { error: err.message });
         trade.stopOrderId = null;
@@ -489,20 +549,43 @@ async function runRealTick() {
         const currentPrice = parseFloat(tickerData?.last_price || tickerData?.bid || 0);
         if (currentPrice <= 0) continue;
 
-        // 1. Check if Binance trailing stop order filled (exchange handles exit)
-        if (!DRY_RUN && trade.stopOrderId && realState.useExchangeStopLoss) {
+        // 1. Check if Binance stop order filled (trailing or fixed - exchange handles exit)
+        const hasExchangeStop = !DRY_RUN && realState.useExchangeStopLoss && (trade.stopOrderId || trade.stopLossOrderId);
+        if (hasExchangeStop) {
+          let filledOrder = null;
+          let exitPrice = trade.stopLoss;
+          let closeReason = 'STOP_LOSS';
           try {
-            const stopStatus = await getOrderStatus(sym, trade.stopOrderId);
-            const status = (stopStatus.status || stopStatus.order_status || '').toUpperCase();
-            if (status === 'FILLED' || status === 'PARTIALLY_FILLED') {
-              const exitPrice = parseFloat(stopStatus.avgPrice || stopStatus.average_price || trade.stopLoss) || trade.stopLoss;
-              logger.info('Exchange stop order filled', { tradeId: trade.id, symbol: sym, exitPrice, status });
-
+            if (trade.stopOrderId) {
+              const stopStatus = await getOrderStatus(sym, trade.stopOrderId);
+              const status = (stopStatus.status || stopStatus.order_status || '').toUpperCase();
+              if (status === 'FILLED' || status === 'PARTIALLY_FILLED') {
+                filledOrder = 'trailing';
+                exitPrice = parseFloat(stopStatus.avgPrice || stopStatus.average_price || trade.stopLoss) || trade.stopLoss;
+                closeReason = 'TRAILING_STOP';
+              }
+            }
+            if (!filledOrder && trade.stopLossOrderId) {
+              const slStatus = await getOrderStatus(sym, trade.stopLossOrderId);
+              const status = (slStatus.status || slStatus.order_status || '').toUpperCase();
+              if (status === 'FILLED' || status === 'PARTIALLY_FILLED') {
+                filledOrder = 'fixed';
+                exitPrice = parseFloat(slStatus.avgPrice || slStatus.average_price || trade.stopLoss) || trade.stopLoss;
+                closeReason = 'STOP_LOSS';
+              }
+            }
+            if (filledOrder) {
+              logger.info('Exchange stop order filled', { tradeId: trade.id, symbol: sym, exitPrice, type: filledOrder });
+              // Cancel the other order (best effort - position may already be closed)
+              if (filledOrder === 'trailing' && trade.stopLossOrderId) {
+                try { await cancelOrder(sym, trade.stopLossOrderId); } catch (e) { /* ignore */ }
+              } else if (filledOrder === 'fixed' && trade.stopOrderId) {
+                try { await cancelOrder(sym, trade.stopOrderId); } catch (e) { /* ignore */ }
+              }
               const isShort = trade.side === 'SELL';
               const pnl = isShort
                 ? (trade.entryPrice - exitPrice) * trade.quantity
                 : (exitPrice - trade.entryPrice) * trade.quantity;
-
               const closedTrade = {
                 ...trade,
                 symbol: sym,
@@ -511,9 +594,8 @@ async function runRealTick() {
                 status: 'CLOSED',
                 closedAt: Date.now(),
               };
-              await tradePersistence.persistTradeClose(closedTrade, 'STOP_LOSS', 'real');
+              await tradePersistence.persistTradeClose(closedTrade, closeReason, 'real');
               realState.lastTradeClosedAt = Date.now();
-
               if (realState.symbols.length > 1) {
                 realState.openTrades = realState.openTrades.filter((t) => t.id !== trade.id);
               } else {
@@ -522,7 +604,7 @@ async function runRealTick() {
               continue;
             }
           } catch (err) {
-            logger.warn('Failed to check stop order status', { stopOrderId: trade.stopOrderId, error: err.message });
+            logger.warn('Failed to check stop order status', { stopOrderId: trade.stopOrderId, stopLossOrderId: trade.stopLossOrderId, error: err.message });
           }
         }
 
@@ -550,7 +632,7 @@ async function runRealTick() {
         }
 
         // Skip manual sell for STOP_LOSS/TRAILING_STOP when we have exchange stop (exchange handles it)
-        const useExchangeForStop = !DRY_RUN && trade.stopOrderId && realState.useExchangeStopLoss;
+        const useExchangeForStop = !DRY_RUN && (trade.stopOrderId || trade.stopLossOrderId) && realState.useExchangeStopLoss;
         const isStopExit = exitCheck && (exitCheck.reason === 'STOP_LOSS' || exitCheck.reason === 'TRAILING_STOP');
 
         if (exitCheck && exitCheck.hit && !(useExchangeForStop && isStopExit)) {
@@ -723,6 +805,8 @@ async function runRealTick() {
 
       const useCustomRisk = (realState.strategy === 'trendPullback' && sig.stopLoss && sig.takeProfit)
         || (realState.strategy === 'goldenCrossHTF' && sig.stopLoss);
+      // Real trading uses realRiskPercent (overrides strategy's suggestedRiskPercent)
+      const realRiskPercent = realState.riskPerTrade ?? config.real?.riskPerTrade ?? 0.01;
       const riskParams = useCustomRisk
         ? getTradeRiskParamsCustom(
             entryPrice,
@@ -730,18 +814,32 @@ async function runRealTick() {
             stopLossForRisk,
             sig.takeProfit || Infinity,
             realState.balance,
-            sig.suggestedRiskPercent ?? 0.01
+            realRiskPercent
           )
         : getTradeRiskParams(entryPrice, side, realState.balance);
 
       const { stopLoss, takeProfit } = riskParams;
       const positionSize = useCustomRisk && stopLoss
-        ? getRealPositionSizeWithStop(realState.balance, entryPrice, stopLoss)
+        ? getRealPositionSizeWithStop(realState.balance, entryPrice, stopLoss, realRiskPercent)
         : getRealPositionSize(realState.balance, entryPrice, side);
 
       if (positionSize <= 0) {
         logger.warn('Position size is 0, skipping', { symbol: sig.symbol });
         continue;
+      }
+
+      // Binance min notional: BTC=$100, ETH=$20, most others=$5 - skip if below
+      if (!DRY_RUN) {
+        const minNotional = await getMinNotional(sig.symbol);
+        const notional = positionSize * entryPrice;
+        if (notional < minNotional) {
+          logger.warn('Position below Binance min notional, skipping', {
+            symbol: sig.symbol,
+            notional: roundTo(notional, 2),
+            minNotional,
+          });
+          continue;
+        }
       }
 
       let trade;
@@ -795,9 +893,11 @@ async function startRealTrading(options = {}) {
   realState.strategy = options.strategy || null;
   realState.longOnly = options.longOnly ?? false;
   realState.useExchangeStopLoss = options.useExchangeStopLoss ?? true;
-  realState.trailPercent = options.trailPercent ?? 0.02; // 2% for Binance trailing stop
-  realState.leverage = options.leverage ?? 3; // 3x leverage (set via API before each order)
+  realState.trailPercent = options.trailPercent ?? 0.03; // 3% for Binance trailing stop (lets profits run more)
+  realState.trailActivationPercent = options.trailActivationPercent ?? config.real?.trailActivationPercent ?? 0.015;
+  realState.leverage = options.leverage ?? 5; // 5x leverage (set via API before each order)
   realState.maxCapitalPerTrade = options.maxCapitalPerTrade ?? config.real?.maxCapitalPerTrade ?? null;
+  realState.riskPerTrade = options.riskPerTrade ?? config.real?.riskPerTrade ?? 0.01;
   if (realState.strategy === 'trendPullback') {
     realState.timeframe = '5m';
     realState.htfTimeframe = '15m';

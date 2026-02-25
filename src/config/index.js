@@ -4,7 +4,7 @@
 
 module.exports = {
   // Server
-  port: process.env.PORT || 3000,
+  port: process.env.PORT || 6000,
 
   // Exchange (Binance default)
   exchange: {
@@ -78,7 +78,9 @@ module.exports = {
   // Real trading (Binance Futures)
   real: {
     intervalMs: 60000, // 1 minute
-    maxCapitalPerTrade: 0.15, // 15% per trade (for small accounts; Binance min notional ~$5–20)
+    maxCapitalPerTrade: 0.25, // 25% margin per trade (with leverage = max notional)
+    riskPerTrade: 0.025, // 2.5% risk per trade (larger positions; default 1% is too small for small accounts)
+    trailActivationPercent: 0.015, // 1.5% - trailing only activates after price moves this much in our favor
     maxOpenTrades: 1,
   },
 };

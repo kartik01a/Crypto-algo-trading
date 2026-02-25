@@ -117,6 +117,44 @@ async function getStepSize(symbol) {
 }
 
 /**
+ * Get minNotional (min order value in USDT) for a symbol from Binance MIN_NOTIONAL filter
+ * BTC/USDT = 100, ETH/USDT = 20, most others = 5
+ */
+async function getMinNotional(symbol) {
+  const market = symbolToMarket(symbol);
+  const info = await fetchExchangeInfo();
+  const sym = (info.symbols || []).find((s) => s.symbol === market);
+  if (!sym) return 5; // fallback
+  const notionalFilter = (sym.filters || []).find((f) => f.filterType === 'MIN_NOTIONAL');
+  const notional = parseFloat(notionalFilter?.notional || '5');
+  return notional > 0 ? notional : 5;
+}
+
+/**
+ * Get tickSize for a symbol from Binance PRICE_FILTER (for stopPrice precision)
+ */
+async function getTickSize(symbol) {
+  const market = symbolToMarket(symbol);
+  const info = await fetchExchangeInfo();
+  const sym = (info.symbols || []).find((s) => s.symbol === market);
+  if (!sym) return 0.01; // fallback
+  const priceFilter = (sym.filters || []).find((f) => f.filterType === 'PRICE_FILTER');
+  const tick = parseFloat(priceFilter?.tickSize || '0.01');
+  return tick > 0 ? tick : 0.01;
+}
+
+/**
+ * Format stopPrice for Binance using symbol's tickSize
+ */
+async function formatStopPrice(symbol, price) {
+  const tick = await getTickSize(symbol);
+  const p = parseFloat(price);
+  const precision = tick >= 1 ? 0 : tick.toString().split('.')[1]?.replace(/0+$/, '').length || 8;
+  const rounded = Math.round(p / tick) * tick;
+  return rounded.toFixed(precision);
+}
+
+/**
  * Format quantity for Binance using symbol's stepSize (avoids "Precision is over the maximum" error)
  */
 async function formatQuantity(symbol, quantity) {
@@ -162,10 +200,35 @@ async function placeTrailingStopOrder({ symbol, side, quantity, callbackRate, ac
     quantity: qty,
     reduceOnly: 'true',
     callbackRate: String(Math.min(10, Math.max(0.1, callbackRate))),
+    workingType: 'MARK_PRICE', // Use mark price for trigger (more reliable than last price)
   };
   if (activationPrice != null) {
-    params.activatePrice = String(activationPrice);
+    params.activatePrice = String(await formatStopPrice(symbol, activationPrice));
   }
+  const data = await authenticatedRequest('POST', '/fapi/v1/algoOrder', params);
+  return { orderId: data.algoId, order_id: data.algoId, algoId: data.algoId };
+}
+
+/**
+ * Place fixed stop loss order (STOP_MARKET - safety net, no app dependency)
+ * Uses Algo Order API - required for SOL, XRP, ADA etc (regular order API rejects STOP_MARKET)
+ * Long: SELL triggers when price <= triggerPrice. Short: BUY triggers when price >= triggerPrice.
+ * @param {Object} params - { symbol, side: 'BUY'|'SELL', quantity, stopPrice }
+ */
+async function placeStopLossOrder({ symbol, side, quantity, stopPrice }) {
+  const market = symbolToMarket(symbol);
+  const qty = await formatQuantity(symbol, quantity);
+  const trigger = await formatStopPrice(symbol, stopPrice);
+  const params = {
+    algoType: 'CONDITIONAL',
+    symbol: market,
+    side: side.toUpperCase(),
+    type: 'STOP_MARKET',
+    triggerPrice: trigger,
+    quantity: qty,
+    reduceOnly: 'true',
+    workingType: 'MARK_PRICE', // Use mark price for trigger (more reliable than last price)
+  };
   const data = await authenticatedRequest('POST', '/fapi/v1/algoOrder', params);
   return { orderId: data.algoId, order_id: data.algoId, algoId: data.algoId };
 }
@@ -266,8 +329,10 @@ module.exports = {
   symbolToMarket,
   getAvailableBalance,
   setLeverage,
+  getMinNotional,
   placeMarketOrder,
   placeTrailingStopOrder,
+  placeStopLossOrder,
   fetchCandles,
   fetchTicker,
   getOrderStatus,

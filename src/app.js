@@ -172,7 +172,7 @@ app.get('/api/performance', async (req, res) => {
 
 /**
  * POST /api/real/start
- * Body: { symbol?, symbols?, strategy?, quoteCurrency?, initialBalance? (DRY_RUN), longOnly?, maxOpenTrades?, useExchangeStopLoss?, trailPercent?, leverage?, maxCapitalPerTrade? }
+ * Body: { symbol?, symbols?, strategy?, quoteCurrency?, initialBalance? (DRY_RUN), longOnly?, maxOpenTrades?, useExchangeStopLoss?, trailPercent?, leverage?, maxCapitalPerTrade?, riskPerTrade? }
  * symbols: ['BTC/USDT','ETH/USDT','SOL/USDT'] for multi-symbol (goldenCrossHTF)
  * strategy: 'trendPullback' | 'goldenCrossHTF' | null
  * longOnly: true = skip SELL signals (spot-only, no shorting)
